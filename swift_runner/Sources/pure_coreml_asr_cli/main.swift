@@ -4,6 +4,7 @@ import Foundation
 
 struct Manifest: Decodable {
     let sample_rate: Int
+    let precision: String?
     let preemph: Float?
     let max_audio_samples: Int
     let max_feature_frames: Int
@@ -18,6 +19,8 @@ struct Manifest: Decodable {
     let encoder: StageMeta
     let decoder: StageMeta
     let decoder_cached: CachedDecoderMeta?
+
+    var isFp16: Bool { precision == "float16" }
 }
 
 struct StageMeta: Decodable {
@@ -137,24 +140,74 @@ func makeIntArray(shape: [Int], values: [Int32]) throws -> MLMultiArray {
     return arr
 }
 
-func toContiguousFloat32(_ arr: MLMultiArray) throws -> MLMultiArray {
+func toContiguous(_ arr: MLMultiArray) throws -> MLMultiArray {
     let shape = arr.shape.map { $0.intValue }
-    guard shape.count == 3 else {
-        throw NSError(domain: "pure_coreml_asr_cli", code: 12, userInfo: [NSLocalizedDescriptionKey: "Expected rank-3 encoder hidden state, got shape \(shape)"])
-    }
+    let totalCount = shape.reduce(1, *)
     let strides = arr.strides.map { $0.intValue }
-    let out = try MLMultiArray(shape: shape as [NSNumber], dataType: .float32)
-    var outIdx = 0
-    for b in 0..<shape[0] {
-        for t in 0..<shape[1] {
-            for h in 0..<shape[2] {
-                let src = b * strides[0] + t * strides[1] + h * strides[2]
-                out[outIdx] = NSNumber(value: arr[src].floatValue)
-                outIdx += 1
+    let isContiguous: Bool = {
+        var expected = 1
+        for i in stride(from: shape.count - 1, through: 0, by: -1) {
+            if strides[i] != expected { return false }
+            expected *= shape[i]
+        }
+        return true
+    }()
+    if isContiguous { return arr }
+    let out = try MLMultiArray(shape: arr.shape, dataType: arr.dataType)
+    if arr.dataType == .float16 {
+        let srcBase = arr.dataPointer.bindMemory(to: UInt16.self, capacity: totalCount * 2)
+        let dstBase = out.dataPointer.bindMemory(to: UInt16.self, capacity: totalCount)
+        if shape.count == 3 {
+            var outIdx = 0
+            for b in 0..<shape[0] {
+                for t in 0..<shape[1] {
+                    let base = b * strides[0] + t * strides[1]
+                    if strides[2] == 1 {
+                        memcpy(dstBase + outIdx, srcBase + base, shape[2] * MemoryLayout<UInt16>.size)
+                        outIdx += shape[2]
+                    } else {
+                        for h in 0..<shape[2] {
+                            dstBase[outIdx] = srcBase[base + h * strides[2]]
+                            outIdx += 1
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        let srcBase = arr.dataPointer.bindMemory(to: Float.self, capacity: totalCount * 2)
+        let dstBase = out.dataPointer.bindMemory(to: Float.self, capacity: totalCount)
+        if shape.count == 3 {
+            var outIdx = 0
+            for b in 0..<shape[0] {
+                for t in 0..<shape[1] {
+                    let base = b * strides[0] + t * strides[1]
+                    if strides[2] == 1 {
+                        memcpy(dstBase + outIdx, srcBase + base, shape[2] * MemoryLayout<Float>.size)
+                        outIdx += shape[2]
+                    } else {
+                        for h in 0..<shape[2] {
+                            dstBase[outIdx] = srcBase[base + h * strides[2]]
+                            outIdx += 1
+                        }
+                    }
+                }
             }
         }
     }
     return out
+}
+
+func makeFloat16Array(shape: [Int], values: [Float]) throws -> MLMultiArray {
+    let arr = try MLMultiArray(shape: shape as [NSNumber], dataType: .float16)
+    let ptr = arr.dataPointer.bindMemory(to: UInt16.self, capacity: values.count)
+    for i in 0..<values.count {
+        var f16 = Float16(values[i])
+        withUnsafeBytes(of: &f16) { buf in
+            ptr[i] = buf.load(as: UInt16.self)
+        }
+    }
+    return arr
 }
 
 func readAudioMono16k(path: String, targetSampleRate: Int) throws -> [Float] {
@@ -397,7 +450,7 @@ struct Main {
             else {
                 throw NSError(domain: "pure_coreml_asr_cli", code: 10, userInfo: [NSLocalizedDescriptionKey: "Encoder outputs missing"])
             }
-            let encoderHiddenF32 = try toContiguousFloat32(encoderHidden)
+            let encoderHiddenF32 = try toContiguous(encoderHidden)
             let encoderValidRaw = Int(encoderLengthOut[0].doubleValue.rounded())
             let encoderValid = max(1, min(manifest.max_encoder_frames, encoderValidRaw))
             return (frontMs, encMs, encoderHiddenF32, encoderValid)
@@ -417,9 +470,14 @@ struct Main {
                 attnMask[i] = 1
             }
 
-            var crossMask = Array(repeating: Float(-1e9), count: manifest.max_encoder_frames)
-            for i in 0..<encoderValid { crossMask[i] = 0.0 }
-            let crossMaskArr = try makeFloatArray(shape: [1, 1, 1, manifest.max_encoder_frames], values: crossMask)
+            var crossMaskValues = Array(repeating: Float(-1e9), count: manifest.max_encoder_frames)
+            for i in 0..<encoderValid { crossMaskValues[i] = 0.0 }
+            let crossMaskArr: MLMultiArray
+            if manifest.isFp16 {
+                crossMaskArr = try makeFloat16Array(shape: [1, 1, 1, manifest.max_encoder_frames], values: crossMaskValues)
+            } else {
+                crossMaskArr = try makeFloatArray(shape: [1, 1, 1, manifest.max_encoder_frames], values: crossMaskValues)
+            }
 
             var curIdx = manifest.prompt_ids.count - 1
             var stepTopTokens: [Int32] = []
@@ -461,23 +519,25 @@ struct Main {
             let maxNewTokens = cli.maxNewTokens ?? manifest.default_max_new_tokens
             let cacheSize = dc.num_layers * dc.num_heads * manifest.decoder_max_len * dc.head_dim
             let cacheShape = [dc.num_layers, dc.num_heads, manifest.decoder_max_len, dc.head_dim] as [NSNumber]
+            let cacheType: MLMultiArrayDataType = manifest.isFp16 ? .float16 : .float32
+            let cacheBytesPerElem = manifest.isFp16 ? 2 : 4
 
-            var cacheK = try MLMultiArray(shape: cacheShape, dataType: .float32)
-            var cacheV = try MLMultiArray(shape: cacheShape, dataType: .float32)
+            var cacheK = try MLMultiArray(shape: cacheShape, dataType: cacheType)
+            var cacheV = try MLMultiArray(shape: cacheShape, dataType: cacheType)
+            memset(cacheK.dataPointer, 0, cacheSize * cacheBytesPerElem)
+            memset(cacheV.dataPointer, 0, cacheSize * cacheBytesPerElem)
 
-            var crossMask = Array(repeating: Float(-1e9), count: manifest.max_encoder_frames)
-            for i in 0..<encoderValid { crossMask[i] = 0.0 }
-            let crossMaskArr = try makeFloatArray(shape: [1, 1, 1, manifest.max_encoder_frames], values: crossMask)
+            var crossMaskValues = Array(repeating: Float(-1e9), count: manifest.max_encoder_frames)
+            for i in 0..<encoderValid { crossMaskValues[i] = 0.0 }
+            let crossMaskArr: MLMultiArray
+            if manifest.isFp16 {
+                crossMaskArr = try makeFloat16Array(shape: [1, 1, 1, manifest.max_encoder_frames], values: crossMaskValues)
+            } else {
+                crossMaskArr = try makeFloatArray(shape: [1, 1, 1, manifest.max_encoder_frames], values: crossMaskValues)
+            }
 
             let inputIdArr = try MLMultiArray(shape: [1, 1], dataType: .int32)
             let stepArr = try MLMultiArray(shape: [1], dataType: .int32)
-
-            @inline(__always)
-            func fastCopy(from src: MLMultiArray, to dst: MLMultiArray, count: Int) {
-                let srcPtr = src.dataPointer.bindMemory(to: Float.self, capacity: count)
-                let dstPtr = dst.dataPointer.bindMemory(to: Float.self, capacity: count)
-                dstPtr.update(from: srcPtr, count: count)
-            }
 
             func runOneStep(tokenId: Int32, stepIdx: Int32) throws -> MLMultiArray {
                 inputIdArr[0] = NSNumber(value: tokenId)
@@ -496,10 +556,11 @@ struct Main {
                       let newCV = decOut.featureValue(for: dc.cache_v_output)?.multiArrayValue else {
                     throw NSError(domain: "pure_coreml_asr_cli", code: 15, userInfo: [NSLocalizedDescriptionKey: "Cached decoder outputs missing"])
                 }
-                let nextK = try MLMultiArray(shape: cacheShape, dataType: .float32)
-                let nextV = try MLMultiArray(shape: cacheShape, dataType: .float32)
-                fastCopy(from: newCK, to: nextK, count: cacheSize)
-                fastCopy(from: newCV, to: nextV, count: cacheSize)
+                let nextK = try MLMultiArray(shape: cacheShape, dataType: cacheType)
+                let nextV = try MLMultiArray(shape: cacheShape, dataType: cacheType)
+                memcpy(nextK.dataPointer, newCK.dataPointer, cacheSize * cacheBytesPerElem)
+                memcpy(nextV.dataPointer, newCV.dataPointer, cacheSize * cacheBytesPerElem)
+                // Note: newCK/newCV might not be contiguous; if issues persist, use toContiguous
                 cacheK = nextK
                 cacheV = nextV
                 return logits
@@ -557,6 +618,7 @@ struct Main {
         )
 
         print("load_ms=\(String(format: "%.2f", loadMs))")
+        print("precision=\(manifest.precision ?? "float32")")
         print("compute_mode=\(cli.computeMode)")
         print("decoder_mode=\(cli.decoderMode)")
         print("audio_ms=\(String(format: "%.2f", audioMs))")

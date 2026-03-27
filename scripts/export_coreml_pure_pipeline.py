@@ -339,6 +339,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--punctuation", action="store_true", default=True)
     p.add_argument("--max-new-tokens", type=int, default=96)
     p.add_argument("--max-audio-seconds", type=float, default=30.0)
+    p.add_argument("--precision", choices=["float32", "float16"], default="float16",
+                   help="Compute precision for encoder/decoder (frontend always fp32)")
     p.add_argument("--artifacts-dir", default=str(root / "artifacts"))
     p.add_argument("--report-json", default=str(root / "reports" / "export_pure_coreml_report.json"))
     return p.parse_args()
@@ -427,16 +429,22 @@ def main() -> None:
     artifacts_dir = Path(args.artifacts_dir)
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
+    use_fp16 = args.precision == "float16"
+    model_precision = ct.precision.FLOAT16 if use_fp16 else ct.precision.FLOAT32
+    float_dtype = np.float16 if use_fp16 else np.float32
+    min_target = ct.target.macOS13
+
     frontend_pkg = artifacts_dir / "cohere_frontend.mlpackage"
     encoder_pkg = artifacts_dir / "cohere_encoder.mlpackage"
     decoder_pkg = artifacts_dir / "cohere_decoder_fullseq_masked.mlpackage"
     decoder_cached_pkg = artifacts_dir / "cohere_decoder_cached.mlpackage"
     manifest_path = artifacts_dir / "coreml_manifest.json"
 
+    # Frontend stays fp32 — precision-sensitive audio processing (STFT, log-mel)
     frontend_model = ct.convert(
         front_traced,
         convert_to="mlprogram",
-        minimum_deployment_target=ct.target.macOS13,
+        minimum_deployment_target=min_target,
         compute_units=ct.ComputeUnit.CPU_AND_NE,
         compute_precision=ct.precision.FLOAT32,
         inputs=[
@@ -449,9 +457,9 @@ def main() -> None:
     encoder_model = ct.convert(
         enc_traced,
         convert_to="mlprogram",
-        minimum_deployment_target=ct.target.macOS13,
+        minimum_deployment_target=min_target,
         compute_units=ct.ComputeUnit.CPU_AND_NE,
-        compute_precision=ct.precision.FLOAT32,
+        compute_precision=model_precision,
         inputs=[
             ct.TensorType(name="input_features", shape=tuple(dummy_features.shape), dtype=np.float32),
             ct.TensorType(name="feature_length", shape=tuple(dummy_feat_len.shape), dtype=np.int32),
@@ -462,14 +470,14 @@ def main() -> None:
     decoder_model = ct.convert(
         dec_traced,
         convert_to="mlprogram",
-        minimum_deployment_target=ct.target.macOS13,
+        minimum_deployment_target=min_target,
         compute_units=ct.ComputeUnit.CPU_AND_NE,
-        compute_precision=ct.precision.FLOAT32,
+        compute_precision=model_precision,
         inputs=[
-            ct.TensorType(name="encoder_hidden_states", shape=tuple(dummy_encoder_hidden.shape), dtype=np.float32),
+            ct.TensorType(name="encoder_hidden_states", shape=tuple(dummy_encoder_hidden.shape), dtype=float_dtype),
             ct.TensorType(name="input_ids", shape=tuple(dummy_input_ids.shape), dtype=np.int32),
             ct.TensorType(name="decoder_attention_mask", shape=tuple(dummy_dec_mask.shape), dtype=np.int32),
-            ct.TensorType(name="cross_attention_mask", shape=tuple(dummy_cross_mask.shape), dtype=np.float32),
+            ct.TensorType(name="cross_attention_mask", shape=tuple(dummy_cross_mask.shape), dtype=float_dtype),
         ],
     )
     decoder_model.save(str(decoder_pkg))
@@ -477,16 +485,16 @@ def main() -> None:
     decoder_cached_model = ct.convert(
         dec_cached_traced,
         convert_to="mlprogram",
-        minimum_deployment_target=ct.target.macOS13,
+        minimum_deployment_target=min_target,
         compute_units=ct.ComputeUnit.CPU_AND_NE,
-        compute_precision=ct.precision.FLOAT32,
+        compute_precision=model_precision,
         inputs=[
-            ct.TensorType(name="encoder_hidden_states", shape=tuple(dummy_encoder_hidden.shape), dtype=np.float32),
+            ct.TensorType(name="encoder_hidden_states", shape=tuple(dummy_encoder_hidden.shape), dtype=float_dtype),
             ct.TensorType(name="input_id", shape=(1, 1), dtype=np.int32),
-            ct.TensorType(name="cache_k", shape=tuple(dummy_cache_k.shape), dtype=np.float32),
-            ct.TensorType(name="cache_v", shape=tuple(dummy_cache_v.shape), dtype=np.float32),
+            ct.TensorType(name="cache_k", shape=tuple(dummy_cache_k.shape), dtype=float_dtype),
+            ct.TensorType(name="cache_v", shape=tuple(dummy_cache_v.shape), dtype=float_dtype),
             ct.TensorType(name="step", shape=(1,), dtype=np.int32),
-            ct.TensorType(name="cross_attention_mask", shape=(1, 1, 1, max_encoder_frames), dtype=np.float32),
+            ct.TensorType(name="cross_attention_mask", shape=(1, 1, 1, max_encoder_frames), dtype=float_dtype),
         ],
     )
     decoder_cached_model.save(str(decoder_cached_pkg))
@@ -510,6 +518,7 @@ def main() -> None:
 
     manifest: Dict[str, Any] = {
         "model_id": args.model_id,
+        "precision": args.precision,
         "sample_rate": sample_rate,
         "preemph": preemph_coeff,
         "max_audio_samples": max_audio_samples,
