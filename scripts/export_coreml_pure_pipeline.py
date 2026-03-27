@@ -211,6 +211,94 @@ class FullSeqDecoderMasked(torch.nn.Module):
         return self.classifier(outputs)
 
 
+class DecoderStepCached(torch.nn.Module):
+    """Single-step decoder with KV cache for fast autoregressive generation.
+
+    Instead of recomputing the full sequence each step, this processes only
+    the new token and updates the self-attention KV cache in-place.
+    Cross-attention K/V are recomputed from encoder_hidden_states each step
+    (small cost since Q is a single token).
+    """
+
+    def __init__(self, model: torch.nn.Module, max_len: int):
+        super().__init__()
+        self.embedding = model.transf_decoder._embedding
+        self.decoder_layers = model.transf_decoder._decoder.layers
+        self.final_ln = model.transf_decoder._decoder.final_layer_norm
+        self.classifier = model.log_softmax.mlp.layer0
+        self.max_len = max_len
+        first_attn = self.decoder_layers[0].first_sub_layer
+        self.num_heads = first_attn.num_heads
+        self.head_dim = first_attn.head_dim
+
+    def _manual_attn(self, q, k, v, scale: float, mask=None):
+        scores = torch.matmul(q, k.transpose(-1, -2)) * scale
+        if mask is not None:
+            scores = scores + mask
+        return torch.matmul(torch.softmax(scores, dim=-1), v)
+
+    def _update_cache(self, cache, layer_idx, new_kv, step_idx):
+        cur = cache[layer_idx : layer_idx + 1]  # [1, H, T, D]
+        oh = torch.nn.functional.one_hot(step_idx, num_classes=self.max_len).to(dtype=cur.dtype)
+        oh = oh.view(1, 1, self.max_len, 1)
+        return cur * (1.0 - oh) + new_kv.expand(-1, -1, self.max_len, -1) * oh
+
+    def forward(
+        self,
+        encoder_hidden_states: torch.Tensor,  # [1, S, H]
+        input_id: torch.Tensor,               # [1, 1]  int32
+        cache_k: torch.Tensor,                # [L, H, T, D]
+        cache_v: torch.Tensor,                # [L, H, T, D]
+        step: torch.Tensor,                   # [1]     int32
+        cross_attention_mask: torch.Tensor,    # [1, 1, 1, S]
+    ):
+        step_idx = step.to(torch.int64).reshape(1)
+        hidden = self.embedding(input_id.to(torch.int64), step_idx.view(1, 1))
+        new_ck, new_cv = [], []
+
+        for i, layer in enumerate(self.decoder_layers):
+            residual = hidden
+            x = layer.layer_norm_1(hidden)
+            sa = layer.first_sub_layer
+            q = sa._reshape(sa.query_net(x))
+            k_new = sa._reshape(sa.key_net(x))
+            v_new = sa._reshape(sa.value_net(x))
+
+            k_upd = self._update_cache(cache_k, i, k_new, step_idx)
+            v_upd = self._update_cache(cache_v, i, v_new, step_idx)
+
+            pos = torch.arange(self.max_len, device=step.device, dtype=step_idx.dtype).view(1, 1, 1, self.max_len)
+            attn_mask = torch.where(
+                pos <= step_idx.view(1, 1, 1, 1),
+                torch.zeros((1, 1, 1, self.max_len), device=step.device, dtype=hidden.dtype),
+                torch.full((1, 1, 1, self.max_len), -1e9, device=step.device, dtype=hidden.dtype),
+            )
+            out = self._manual_attn(q, k_upd, v_upd, sa.scale, mask=attn_mask)
+            out = out.transpose(1, 2).contiguous().view(1, 1, sa.hidden_size)
+            hidden = residual + sa.out_projection(out)
+
+            residual = hidden
+            x = layer.layer_norm_2(hidden)
+            ca = layer.second_sub_layer
+            q = ca._reshape(ca.query_net(x))
+            k = ca._reshape(ca.key_net(encoder_hidden_states))
+            v = ca._reshape(ca.value_net(encoder_hidden_states))
+            out = self._manual_attn(q, k, v, ca.scale, mask=cross_attention_mask.to(dtype=hidden.dtype))
+            out = out.transpose(1, 2).contiguous().view(1, 1, ca.hidden_size)
+            hidden = residual + ca.out_projection(out)
+
+            residual = hidden
+            x = layer.layer_norm_3(hidden)
+            hidden = residual + layer.third_sub_layer(x)
+
+            new_ck.append(k_upd.squeeze(0))
+            new_cv.append(v_upd.squeeze(0))
+
+        hidden = self.final_ln(hidden)
+        logits = self.classifier(hidden)[:, -1, :]  # [1, V]
+        return logits, torch.stack(new_ck, dim=0), torch.stack(new_cv, dim=0)
+
+
 def patch_model_for_tracing(model: torch.nn.Module) -> None:
     pre_encode = model.encoder.pre_encode
     pre_encode._needs_conv_split = types.MethodType(lambda self, x: False, pre_encode)
@@ -307,11 +395,31 @@ def main() -> None:
     with torch.no_grad():
         _ = decoder(dummy_encoder_hidden, dummy_input_ids, dummy_dec_mask, dummy_cross_mask)
 
+    # Cached (single-step) decoder
+    dec_layers = model.transf_decoder._decoder.layers
+    num_dec_layers = len(dec_layers)
+    num_heads = dec_layers[0].first_sub_layer.num_heads
+    head_dim = dec_layers[0].first_sub_layer.head_dim
+    decoder_cached = DecoderStepCached(model, max_len=decoder_max_len).eval()
+    dummy_input_id = torch.tensor([[0]], dtype=torch.int32)
+    dummy_cache_k = torch.zeros((num_dec_layers, num_heads, decoder_max_len, head_dim), dtype=torch.float32)
+    dummy_cache_v = torch.zeros((num_dec_layers, num_heads, decoder_max_len, head_dim), dtype=torch.float32)
+    dummy_step = torch.tensor([0], dtype=torch.int32)
+    dummy_cached_cross = torch.zeros((1, 1, 1, max_encoder_frames), dtype=torch.float32)
+    with torch.no_grad():
+        _ = decoder_cached(dummy_encoder_hidden, dummy_input_id, dummy_cache_k, dummy_cache_v, dummy_step, dummy_cached_cross)
+
     front_traced = torch.jit.trace(frontend, (dummy_audio, dummy_audio_len), strict=False, check_trace=False)
     enc_traced = torch.jit.trace(encoder, (dummy_features, dummy_feat_len), strict=False, check_trace=False)
     dec_traced = torch.jit.trace(
         decoder,
         (dummy_encoder_hidden, dummy_input_ids, dummy_dec_mask, dummy_cross_mask),
+        strict=False,
+        check_trace=False,
+    )
+    dec_cached_traced = torch.jit.trace(
+        decoder_cached,
+        (dummy_encoder_hidden, dummy_input_id, dummy_cache_k, dummy_cache_v, dummy_step, dummy_cached_cross),
         strict=False,
         check_trace=False,
     )
@@ -322,6 +430,7 @@ def main() -> None:
     frontend_pkg = artifacts_dir / "cohere_frontend.mlpackage"
     encoder_pkg = artifacts_dir / "cohere_encoder.mlpackage"
     decoder_pkg = artifacts_dir / "cohere_decoder_fullseq_masked.mlpackage"
+    decoder_cached_pkg = artifacts_dir / "cohere_decoder_cached.mlpackage"
     manifest_path = artifacts_dir / "coreml_manifest.json"
 
     frontend_model = ct.convert(
@@ -365,6 +474,40 @@ def main() -> None:
     )
     decoder_model.save(str(decoder_pkg))
 
+    decoder_cached_model = ct.convert(
+        dec_cached_traced,
+        convert_to="mlprogram",
+        minimum_deployment_target=ct.target.macOS13,
+        compute_units=ct.ComputeUnit.CPU_AND_NE,
+        compute_precision=ct.precision.FLOAT32,
+        inputs=[
+            ct.TensorType(name="encoder_hidden_states", shape=tuple(dummy_encoder_hidden.shape), dtype=np.float32),
+            ct.TensorType(name="input_id", shape=(1, 1), dtype=np.int32),
+            ct.TensorType(name="cache_k", shape=tuple(dummy_cache_k.shape), dtype=np.float32),
+            ct.TensorType(name="cache_v", shape=tuple(dummy_cache_v.shape), dtype=np.float32),
+            ct.TensorType(name="step", shape=(1,), dtype=np.int32),
+            ct.TensorType(name="cross_attention_mask", shape=(1, 1, 1, max_encoder_frames), dtype=np.float32),
+        ],
+    )
+    decoder_cached_model.save(str(decoder_cached_pkg))
+    cached_output_names = _pick_output_names(decoder_cached_model.get_spec())
+    cache_elem_count = int(np.prod(dummy_cache_k.shape))
+    logits_out_name = None
+    cache_k_out_name = None
+    cache_v_out_name = None
+    for oname in cached_output_names:
+        ospec = decoder_cached_model.get_spec()
+        for o in ospec.description.output:
+            if o.name == oname:
+                shape = list(o.type.multiArrayType.shape)
+                if int(np.prod(shape)) == cache_elem_count:
+                    if cache_k_out_name is None:
+                        cache_k_out_name = oname
+                    else:
+                        cache_v_out_name = oname
+                else:
+                    logits_out_name = oname
+
     manifest: Dict[str, Any] = {
         "model_id": args.model_id,
         "sample_rate": sample_rate,
@@ -394,6 +537,17 @@ def main() -> None:
             "inputs": ["encoder_hidden_states", "input_ids", "decoder_attention_mask", "cross_attention_mask"],
             "outputs": _pick_output_names(decoder_model.get_spec()),
         },
+        "decoder_cached": {
+            "package": decoder_cached_pkg.name,
+            "inputs": ["encoder_hidden_states", "input_id", "cache_k", "cache_v", "step", "cross_attention_mask"],
+            "outputs": cached_output_names,
+            "logits_output": logits_out_name,
+            "cache_k_output": cache_k_out_name,
+            "cache_v_output": cache_v_out_name,
+            "num_layers": num_dec_layers,
+            "num_heads": num_heads,
+            "head_dim": head_dim,
+        },
     }
     with manifest_path.open("w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
@@ -402,6 +556,7 @@ def main() -> None:
         "frontend_package": str(frontend_pkg),
         "encoder_package": str(encoder_pkg),
         "decoder_package": str(decoder_pkg),
+        "decoder_cached_package": str(decoder_cached_pkg),
         "manifest_json": str(manifest_path),
         "max_audio_samples": max_audio_samples,
         "max_feature_frames": max_feature_frames,

@@ -17,6 +17,7 @@ struct Manifest: Decodable {
     let frontend: StageMeta
     let encoder: StageMeta
     let decoder: StageMeta
+    let decoder_cached: CachedDecoderMeta?
 }
 
 struct StageMeta: Decodable {
@@ -25,11 +26,24 @@ struct StageMeta: Decodable {
     let outputs: [String]
 }
 
+struct CachedDecoderMeta: Decodable {
+    let package: String
+    let inputs: [String]
+    let outputs: [String]
+    let logits_output: String
+    let cache_k_output: String
+    let cache_v_output: String
+    let num_layers: Int
+    let num_heads: Int
+    let head_dim: Int
+}
+
 struct CliArgs {
     let audioPath: String
     let artifactsDir: String
     let compiledCacheDir: String
     let computeMode: String
+    let decoderMode: String
     let traceJsonPath: String?
     let maxNewTokens: Int?
 }
@@ -44,6 +58,7 @@ func parseArgs(_ args: [String]) throws -> CliArgs {
     var artifactsDir = defaultArtifacts
     var compiledCacheDir = URL(fileURLWithPath: defaultArtifacts).appendingPathComponent(".compiled").path
     var computeMode = "ane"
+    var decoderMode = "cached"
 
     var i = 1
     while i < args.count {
@@ -73,6 +88,11 @@ func parseArgs(_ args: [String]) throws -> CliArgs {
             i += 2
             continue
         }
+        if key == "--decoder-mode", i + 1 < args.count {
+            decoderMode = args[i + 1].lowercased()
+            i += 2
+            continue
+        }
         if key == "--max-new-tokens", i + 1 < args.count {
             maxNewTokens = Int(args[i + 1])
             i += 2
@@ -94,6 +114,7 @@ func parseArgs(_ args: [String]) throws -> CliArgs {
         artifactsDir: artifactsDir,
         compiledCacheDir: compiledCacheDir,
         computeMode: computeMode,
+        decoderMode: decoderMode,
         traceJsonPath: tracePath,
         maxNewTokens: maxNewTokens
     )
@@ -202,6 +223,16 @@ func applyPreemphasis(_ audio: inout [Float], rawLength: Int, coeff: Float) {
     }
 }
 
+func argmax1D(_ arr: MLMultiArray) -> Int32 {
+    var best = arr[0].doubleValue
+    var bestIdx = 0
+    for i in 1..<arr.count {
+        let v = arr[i].doubleValue
+        if v > best { best = v; bestIdx = i }
+    }
+    return Int32(bestIdx)
+}
+
 func argmaxSlice(_ arr: MLMultiArray, tokenIndex: Int, vocabSize: Int) -> Int32 {
     // Respect tensor strides; output is [1, T, V] but not guaranteed contiguous.
     let strideT = arr.strides[1].intValue
@@ -302,9 +333,15 @@ struct Main {
 
         let artifactsURL = URL(fileURLWithPath: cli.artifactsDir)
         let compiledCacheURL = URL(fileURLWithPath: cli.compiledCacheDir)
+        let useCached = cli.decoderMode == "cached"
         let frontendURL = artifactsURL.appendingPathComponent(manifest.frontend.package)
         let encoderURL = artifactsURL.appendingPathComponent(manifest.encoder.package)
-        let decoderURL = artifactsURL.appendingPathComponent(manifest.decoder.package)
+        let decoderURL: URL
+        if useCached, let dc = manifest.decoder_cached {
+            decoderURL = artifactsURL.appendingPathComponent(dc.package)
+        } else {
+            decoderURL = artifactsURL.appendingPathComponent(manifest.decoder.package)
+        }
 
         let tLoad0 = Date()
         let frontendLoaded = try loadModel(frontendURL, compiledCacheRoot: compiledCacheURL, computeMode: cli.computeMode)
@@ -335,7 +372,7 @@ struct Main {
             manifest.frontend.inputs[1]: MLFeatureValue(multiArray: audioLenArr),
         ])
 
-        func runPipeline() throws -> (frontMs: Double, encMs: Double, decMs: Double, used: [Int32], stepTopTokens: [Int32]) {
+        func runFrontendEncoder() throws -> (frontMs: Double, encMs: Double, encoderHiddenF32: MLMultiArray, encoderValid: Int) {
             let tFront0 = Date()
             let frontOut = try frontendModel.prediction(from: frontInputs)
             let frontMs = Date().timeIntervalSince(tFront0) * 1000
@@ -363,6 +400,13 @@ struct Main {
             let encoderHiddenF32 = try toContiguousFloat32(encoderHidden)
             let encoderValidRaw = Int(encoderLengthOut[0].doubleValue.rounded())
             let encoderValid = max(1, min(manifest.max_encoder_frames, encoderValidRaw))
+            return (frontMs, encMs, encoderHiddenF32, encoderValid)
+        }
+
+        func runFullSeqPipeline() throws -> (frontMs: Double, encMs: Double, decMs: Double, used: [Int32], stepTopTokens: [Int32]) {
+            let fe = try runFrontendEncoder()
+            let encoderHiddenF32 = fe.encoderHiddenF32
+            let encoderValid = fe.encoderValid
 
             let vocabSize = manifest.id_to_token.count
             let maxNewTokens = cli.maxNewTokens ?? manifest.default_max_new_tokens
@@ -403,9 +447,98 @@ struct Main {
             }
             let decMs = Date().timeIntervalSince(tDec0) * 1000
             let used = Array(inputIds[0...curIdx])
-            return (frontMs, encMs, decMs, used, stepTopTokens)
+            return (fe.frontMs, fe.encMs, decMs, used, stepTopTokens)
         }
 
+        func runCachedPipeline() throws -> (frontMs: Double, encMs: Double, decMs: Double, used: [Int32], stepTopTokens: [Int32]) {
+            guard let dc = manifest.decoder_cached else {
+                throw NSError(domain: "pure_coreml_asr_cli", code: 14, userInfo: [NSLocalizedDescriptionKey: "decoder_cached not found in manifest"])
+            }
+            let fe = try runFrontendEncoder()
+            let encoderHiddenF32 = fe.encoderHiddenF32
+            let encoderValid = fe.encoderValid
+
+            let maxNewTokens = cli.maxNewTokens ?? manifest.default_max_new_tokens
+            let cacheSize = dc.num_layers * dc.num_heads * manifest.decoder_max_len * dc.head_dim
+            let cacheShape = [dc.num_layers, dc.num_heads, manifest.decoder_max_len, dc.head_dim] as [NSNumber]
+
+            var cacheK = try MLMultiArray(shape: cacheShape, dataType: .float32)
+            var cacheV = try MLMultiArray(shape: cacheShape, dataType: .float32)
+
+            var crossMask = Array(repeating: Float(-1e9), count: manifest.max_encoder_frames)
+            for i in 0..<encoderValid { crossMask[i] = 0.0 }
+            let crossMaskArr = try makeFloatArray(shape: [1, 1, 1, manifest.max_encoder_frames], values: crossMask)
+
+            let inputIdArr = try MLMultiArray(shape: [1, 1], dataType: .int32)
+            let stepArr = try MLMultiArray(shape: [1], dataType: .int32)
+
+            @inline(__always)
+            func fastCopy(from src: MLMultiArray, to dst: MLMultiArray, count: Int) {
+                let srcPtr = src.dataPointer.bindMemory(to: Float.self, capacity: count)
+                let dstPtr = dst.dataPointer.bindMemory(to: Float.self, capacity: count)
+                dstPtr.update(from: srcPtr, count: count)
+            }
+
+            func runOneStep(tokenId: Int32, stepIdx: Int32) throws -> MLMultiArray {
+                inputIdArr[0] = NSNumber(value: tokenId)
+                stepArr[0] = NSNumber(value: stepIdx)
+                let decInputs = try MLDictionaryFeatureProvider(dictionary: [
+                    "encoder_hidden_states": MLFeatureValue(multiArray: encoderHiddenF32),
+                    "input_id": MLFeatureValue(multiArray: inputIdArr),
+                    "cache_k": MLFeatureValue(multiArray: cacheK),
+                    "cache_v": MLFeatureValue(multiArray: cacheV),
+                    "step": MLFeatureValue(multiArray: stepArr),
+                    "cross_attention_mask": MLFeatureValue(multiArray: crossMaskArr),
+                ])
+                let decOut = try decoderModel.prediction(from: decInputs)
+                guard let logits = decOut.featureValue(for: dc.logits_output)?.multiArrayValue,
+                      let newCK = decOut.featureValue(for: dc.cache_k_output)?.multiArrayValue,
+                      let newCV = decOut.featureValue(for: dc.cache_v_output)?.multiArrayValue else {
+                    throw NSError(domain: "pure_coreml_asr_cli", code: 15, userInfo: [NSLocalizedDescriptionKey: "Cached decoder outputs missing"])
+                }
+                let nextK = try MLMultiArray(shape: cacheShape, dataType: .float32)
+                let nextV = try MLMultiArray(shape: cacheShape, dataType: .float32)
+                fastCopy(from: newCK, to: nextK, count: cacheSize)
+                fastCopy(from: newCV, to: nextV, count: cacheSize)
+                cacheK = nextK
+                cacheV = nextV
+                return logits
+            }
+
+            var stepTopTokens: [Int32] = []
+            var generated = manifest.prompt_ids.map { Int32($0) }
+
+            let tDec0 = Date()
+            var lastLogits: MLMultiArray?
+            for (i, tid) in manifest.prompt_ids.enumerated() {
+                lastLogits = try runOneStep(tokenId: Int32(tid), stepIdx: Int32(i))
+            }
+
+            var curIdx = manifest.prompt_ids.count
+            if let logits = lastLogits {
+                let next = argmax1D(logits)
+                stepTopTokens.append(next)
+                generated.append(next)
+                if let eos = manifest.eos_token_id, Int(next) == eos {
+                    let decMs = Date().timeIntervalSince(tDec0) * 1000
+                    return (fe.frontMs, fe.encMs, decMs, generated, stepTopTokens)
+                }
+            }
+
+            for _ in 1..<maxNewTokens {
+                if curIdx >= manifest.decoder_max_len { break }
+                let logits = try runOneStep(tokenId: generated.last!, stepIdx: Int32(curIdx))
+                let next = argmax1D(logits)
+                stepTopTokens.append(next)
+                generated.append(next)
+                curIdx += 1
+                if let eos = manifest.eos_token_id, Int(next) == eos { break }
+            }
+            let decMs = Date().timeIntervalSince(tDec0) * 1000
+            return (fe.frontMs, fe.encMs, decMs, generated, stepTopTokens)
+        }
+
+        let runPipeline = useCached ? runCachedPipeline : runFullSeqPipeline
         if needsAnewarmup {
             _ = try runPipeline()
         }
@@ -425,6 +558,7 @@ struct Main {
 
         print("load_ms=\(String(format: "%.2f", loadMs))")
         print("compute_mode=\(cli.computeMode)")
+        print("decoder_mode=\(cli.decoderMode)")
         print("audio_ms=\(String(format: "%.2f", audioMs))")
         print("frontend_ms=\(String(format: "%.2f", frontMs))")
         print("encoder_ms=\(String(format: "%.2f", encMs))")
