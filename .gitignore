@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+artifacts/
+reports/
+logs/
+swift_runner/.build/
+swift_runner/.swiftpm/
+.DS_Store

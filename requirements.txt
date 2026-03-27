@@ -1,0 +1,10 @@
+torch==2.2.2
+torchaudio==2.2.2
+transformers==4.57.6
+huggingface_hub==0.36.2
+coremltools==8.3.0
+soundfile==0.12.1
+numpy==1.26.4
+sentencepiece==0.2.0
+librosa==0.10.2.post1
+scikit-learn==1.5.1
