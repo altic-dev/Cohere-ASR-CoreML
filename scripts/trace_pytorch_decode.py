@@ -3,7 +3,7 @@ import argparse
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import librosa
@@ -13,6 +13,22 @@ from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 
 
 DEFAULT_MODEL = "CohereLabs/cohere-transcribe-03-2026"
+
+
+def decode_like_swift(ids: List[int], vocab: List[str], eos: Optional[int], pad: Optional[int]) -> str:
+    pieces: List[str] = []
+    for tid in ids:
+        if eos is not None and tid == eos:
+            break
+        if pad is not None and tid == pad:
+            continue
+        if tid < 0 or tid >= len(vocab):
+            continue
+        piece = vocab[tid]
+        if piece.startswith("<") and piece.endswith(">"):
+            continue
+        pieces.append(piece)
+    return "".join(pieces).replace("▁", " ").strip()
 
 
 def load_audio_mono(path: str, target_sr: int = 16000):
@@ -35,6 +51,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--punctuation", action="store_true", default=True)
     p.add_argument("--max-new-tokens", type=int, default=96)
     p.add_argument("--output-json", default=str(root / "reports" / "pytorch_decode_trace.json"))
+    p.add_argument("--manifest-json", default=str(root / "artifacts" / "coreml_manifest.json"))
     return p.parse_args()
 
 
@@ -49,14 +66,28 @@ def main() -> None:
 
     processor = AutoProcessor.from_pretrained(args.model_id, trust_remote_code=True, token=token)
     model = AutoModelForSpeechSeq2Seq.from_pretrained(args.model_id, trust_remote_code=True, token=token).to(device).eval()
+    # CoreML frontend export is deterministic and omits runtime dither noise.
+    # Disable dither here to keep token-level parity checks stable.
+    if hasattr(processor, "feature_extractor") and hasattr(processor.feature_extractor, "filterbank"):
+        processor.feature_extractor.filterbank.dither = 0.0
 
     audio, sr = load_audio_mono(audio_file)
     proc = processor(audio=audio, sampling_rate=sr, return_tensors="pt")
     input_features = proc["input_features"].to(device=device, dtype=torch.float32)
 
-    prompt_text = model.build_prompt(language=args.language, punctuation=args.punctuation)
-    prompt_inputs = processor(audio=[audio], text=[prompt_text], sampling_rate=sr, return_tensors="pt")
-    prompt_ids = prompt_inputs["input_ids"][0].to(device=device, dtype=torch.long)
+    manifest_path = Path(args.manifest_json)
+    prompt_ids = None
+    if manifest_path.exists():
+        with manifest_path.open("r", encoding="utf-8") as f:
+            manifest = json.load(f)
+        ids = manifest.get("prompt_ids")
+        if isinstance(ids, list) and ids:
+            prompt_ids = torch.tensor(ids, device=device, dtype=torch.long)
+
+    if prompt_ids is None:
+        prompt_text = model.build_prompt(language=args.language, punctuation=args.punctuation)
+        prompt_inputs = processor(audio=[audio], text=[prompt_text], sampling_rate=sr, return_tensors="pt")
+        prompt_ids = prompt_inputs["input_ids"][0].to(device=device, dtype=torch.long)
 
     generated: List[int] = [int(x) for x in prompt_ids.tolist()]
     step_top_tokens: List[int] = []
@@ -76,7 +107,13 @@ def main() -> None:
             if eos is not None and next_id == int(eos):
                 break
 
-    text = processor.tokenizer.decode(generated, skip_special_tokens=True)
+    vocab = processor.tokenizer.convert_ids_to_tokens(list(range(processor.tokenizer.vocab_size)))
+    text = decode_like_swift(
+        generated,
+        vocab=vocab,
+        eos=processor.tokenizer.eos_token_id,
+        pad=processor.tokenizer.pad_token_id,
+    )
     payload: Dict[str, Any] = {
         "prompt_ids": [int(x) for x in prompt_ids.tolist()],
         "generated_ids": generated,

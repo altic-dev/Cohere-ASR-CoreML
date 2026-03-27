@@ -1,5 +1,45 @@
 # Cohere CoreML Progress (Handoff Snapshot)
 
+## Latest Update (Pure CoreML CLI Milestone)
+- Added canonical Swift CLI target:
+  - `swift_runner/Sources/pure_coreml_asr_cli/main.swift`
+  - Contract: `swift run pure_coreml_asr_cli --audio <path.wav> [--trace-json <path>]`
+  - Output line: `decoded_text=...`
+- Added pure pipeline exporter:
+  - `scripts/export_coreml_pure_pipeline.py`
+  - Exports:
+    - `artifacts/cohere_frontend.mlpackage`
+    - `artifacts/cohere_encoder.mlpackage`
+    - `artifacts/cohere_decoder_fullseq_masked.mlpackage`
+    - `artifacts/coreml_manifest.json`
+- Added parity runner for pure CLI:
+  - `scripts/validate_pure_coreml_cli.py`
+- Updated PyTorch trace for deterministic comparison:
+  - `scripts/trace_pytorch_decode.py` disables dither and supports manifest prompt ids.
+- ANE root-cause update:
+  - Symptom: first ANE decode after fresh `.mlmodelc` compilation could diverge on the demo clip at token index `23`.
+  - Wrong cold token path: `5380` (`▁Council`)
+  - Correct warm/PyTorch token path: `2231, 4512` (`▁European`, `▁Parliament`)
+  - Mitigation now implemented in the Swift CLI:
+    - if ANE models are freshly compiled in `artifacts/.compiled`, the CLI runs one full dry decode pass and discards it
+    - the second pass is used as the real result
+  - Verified after mitigation:
+    - demo clip cold ANE: exact IDs match PyTorch
+    - demo clip warm ANE: exact IDs match PyTorch
+    - short clean clip `needle.`: exact IDs match PyTorch on ANE
+
+## Space Incident + Recovery
+- CoreML conversion left very large temp compile artifacts under:
+  - `/private/var/folders/6d/2vs25c0n37b8_z73k_xrvv900000gn/T`
+- Cleaned stale `cohere_*` temp model directories and failed temp `.mlpackage` files.
+- Recovered significant space; root/data free space increased back to ~`19 GiB` at cleanup time.
+- Added persistent compile cache for Swift CLI:
+  - `artifacts/.compiled/*.mlmodelc`
+  - Prevents repeated temp recompiles and reduces cold `load_ms` after first run.
+- Added temp cleanup utility:
+  - `scripts/cleanup_coreml_temp.sh`
+  - Supports `DRY_RUN=1`.
+
 ## Goal
 Build a pure CoreML ASR pipeline (`audio wav -> text`) for `CohereLabs/cohere-transcribe-03-2026` before any FluidVoice integration.
 
@@ -72,11 +112,9 @@ Build a pure CoreML ASR pipeline (`audio wav -> text`) for `CohereLabs/cohere-tr
 - **Cached path remains experimental** until exact token parity is achieved across eval set.
 
 ## Remaining Gap to Pure CoreML End-to-End
-- Current proven CoreML coverage is decoder-side (first-step/fullseq/cached).
-- To reach true pure CoreML ASR (`wav -> text` with no PyTorch runtime), still needed:
-  1. CoreML frontend/preprocessor stage export/implementation.
-  2. CoreML encoder stage export/implementation.
-  3. Single Swift CLI/runtime chaining frontend -> encoder -> fullseq decoder.
+- Pure CoreML CLI path now exists and runs end-to-end (`wav -> text`) in Swift + CoreML.
+- Remaining hardening item:
+  1. Re-run the ANE exactness sweep on a broader local validation set beyond the demo + short clean clip.
 
 ## Useful Commands
 - Standard exact run:

@@ -10,6 +10,7 @@ let package = Package(
         .executable(name: "swift_runner", targets: ["swift_runner"]),
         .executable(name: "swift_cached_runner", targets: ["swift_cached_runner"]),
         .executable(name: "swift_fullseq_runner", targets: ["swift_fullseq_runner"]),
+        .executable(name: "pure_coreml_asr_cli", targets: ["pure_coreml_asr_cli"]),
     ],
     dependencies: [],
     targets: [
@@ -23,6 +24,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "swift_fullseq_runner",
+            dependencies: []
+        ),
+        .executableTarget(
+            name: "pure_coreml_asr_cli",
             dependencies: []
         ),
     ]

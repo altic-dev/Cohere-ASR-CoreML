@@ -1,0 +1,351 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import types
+from pathlib import Path
+from typing import Any, Dict, List
+
+import coremltools as ct
+import numpy as np
+import torch
+from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
+
+
+DEFAULT_MODEL = "CohereLabs/cohere-transcribe-03-2026"
+
+
+class FrontendCore(torch.nn.Module):
+    def __init__(
+        self,
+        mel_fb: torch.Tensor,  # [1, n_mels, n_fft_bins]
+        window: torch.Tensor,
+        n_fft: int,
+        win_length: int,
+        hop_length: int,
+        preemph: float,
+        pad_to: int,
+        log_zero_guard_value: float,
+        mag_power: float,
+    ):
+        super().__init__()
+        self.register_buffer("mel_fb", mel_fb.to(torch.float32))
+        self.register_buffer("window", window.to(torch.float32))
+        self.n_fft = int(n_fft)
+        self.win_length = int(win_length)
+        self.hop_length = int(hop_length)
+        self.preemph = float(preemph)
+        self.pad_to = int(pad_to)
+        self.log_zero_guard_value = float(log_zero_guard_value)
+        self.mag_power = float(mag_power)
+
+    def get_seq_len(self, seq_len: torch.Tensor) -> torch.Tensor:
+        # Matches feature extractor logic for non-exact-pad path.
+        return torch.floor_divide(seq_len, self.hop_length).to(dtype=torch.int32)
+
+    def forward(self, audio_samples: torch.Tensor, audio_length: torch.Tensor):
+        # audio_samples: [1, max_audio_samples], float32
+        # audio_length: [1], int32
+        x = audio_samples.to(torch.float32)
+        seq_len_time = audio_length.to(torch.int32)
+
+        time_mask = torch.arange(x.shape[1], device=x.device).unsqueeze(0) < seq_len_time.unsqueeze(1)
+        x = torch.cat((x[:, 0].unsqueeze(1), x[:, 1:] - self.preemph * x[:, :-1]), dim=1)
+        x = x.masked_fill(~time_mask, 0.0)
+
+        stft = torch.stft(
+            x,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            center=True,
+            window=self.window.to(dtype=torch.float32, device=x.device),
+            return_complex=True,
+            pad_mode="constant",
+        )
+        mag = torch.sqrt(torch.view_as_real(stft).pow(2).sum(-1))
+        if self.mag_power != 1.0:
+            mag = mag.pow(self.mag_power)
+        mels = torch.matmul(self.mel_fb.to(dtype=mag.dtype), mag)
+        mels = torch.log(mels + self.log_zero_guard_value)
+
+        seq_len = self.get_seq_len(seq_len_time)
+        max_time = mels.shape[2]
+        valid = torch.arange(max_time, device=mels.device).unsqueeze(0) < seq_len.unsqueeze(1)
+
+        mean_num = torch.where(valid.unsqueeze(1), mels, torch.zeros_like(mels)).sum(axis=2)
+        mean_den = torch.clamp(seq_len.to(mels.dtype), min=1.0)
+        mean = mean_num / mean_den.unsqueeze(1)
+        var = torch.where(valid.unsqueeze(1), (mels - mean.unsqueeze(2)) ** 2, torch.zeros_like(mels)).sum(axis=2)
+        var = var / torch.clamp(mean_den.unsqueeze(1) - 1.0, min=1.0)
+        std = torch.sqrt(var)
+        std = std.masked_fill(std.isnan(), 0.0) + 1e-5
+        mels = (mels - mean.unsqueeze(2)) / std.unsqueeze(2)
+
+        mels = mels.masked_fill(~valid.unsqueeze(1), 0.0)
+
+        if self.pad_to > 0:
+            pad_amt = mels.shape[2] % self.pad_to
+            if pad_amt != 0:
+                mels = torch.nn.functional.pad(mels, (0, self.pad_to - pad_amt), value=0.0)
+        return mels, seq_len
+
+
+class EncoderCore(torch.nn.Module):
+    def __init__(self, model: torch.nn.Module):
+        super().__init__()
+        self.encoder = model.encoder
+        self.proj = model.encoder_decoder_proj
+
+    def forward(self, input_features: torch.Tensor, feature_length: torch.Tensor):
+        x, length = self.encoder(input_features, feature_length)
+        if self.proj is not None:
+            x = self.proj(x)
+        return x, length.to(torch.int32)
+
+
+class FullSeqDecoderMasked(torch.nn.Module):
+    def __init__(self, model: torch.nn.Module):
+        super().__init__()
+        self.decoder = model.transf_decoder
+        self.classifier = model.log_softmax.mlp.layer0
+
+    def forward(
+        self,
+        encoder_hidden_states: torch.Tensor,  # [1,S,H]
+        input_ids: torch.Tensor,  # [1,T]
+        decoder_attention_mask: torch.Tensor,  # [1,T]
+        cross_attention_mask: torch.Tensor,  # [1,1,1,S]
+    ):
+        input_ids = input_ids.to(torch.int64)
+        decoder_attention_mask = decoder_attention_mask.to(torch.int64)
+        bsz, t = input_ids.shape
+        device = input_ids.device
+        dtype = encoder_hidden_states.dtype
+
+        positions = torch.arange(t, device=device, dtype=torch.int64).unsqueeze(0).expand(bsz, -1)
+        q_pos = torch.arange(t, device=device).view(t, 1)
+        k_pos = torch.arange(t, device=device).view(1, t)
+        causal_bool = k_pos > q_pos
+        self_attention_mask = torch.zeros((bsz, 1, t, t), device=device, dtype=dtype)
+        self_attention_mask.masked_fill_(causal_bool.view(1, 1, t, t), float("-inf"))
+
+        key_padding = (1.0 - decoder_attention_mask[:, None, None, :].to(dtype=dtype)) * -1e9
+        self_attention_mask = self_attention_mask + key_padding
+
+        outputs, _ = self.decoder(
+            input_ids=input_ids,
+            positions=positions,
+            encoder_hidden_states=encoder_hidden_states,
+            self_attention_mask=self_attention_mask,
+            cross_attention_mask=cross_attention_mask.to(dtype=dtype),
+            past_key_values=None,
+            cache_position=None,
+            kv_seq_len=None,
+        )
+        return self.classifier(outputs)
+
+
+def patch_model_for_tracing(model: torch.nn.Module) -> None:
+    pre_encode = model.encoder.pre_encode
+    pre_encode._needs_conv_split = types.MethodType(lambda self, x: False, pre_encode)
+    pre_encode._conv_split_by_batch = types.MethodType(lambda self, x, lengths: self.conv(x, lengths), pre_encode)
+
+    pos_enc = model.encoder.pos_enc
+
+    def _materialize_pe(self, length: int, device: torch.device, dtype: torch.dtype):
+        needed_size = 2 * length - 1
+        if hasattr(self, "pe") and self.pe.size(1) >= needed_size:
+            if self.pe.device != device:
+                self.pe = self.pe.to(device=device)
+            if self.pe.dtype != dtype:
+                self.pe = self.pe.to(dtype=dtype)
+            return
+        effective_length = max(length, self.max_len)
+        positions = torch.arange(
+            effective_length - 1, -effective_length, -1, dtype=torch.float32, device=device
+        ).unsqueeze(1)
+        pe = self._create_pe(positions=positions, dtype=dtype)
+        if hasattr(self, "pe"):
+            self.pe = pe
+        else:
+            self.register_buffer("pe", pe, persistent=False)
+
+    pos_enc._materialize_pe = types.MethodType(_materialize_pe, pos_enc)
+
+
+def _pick_output_names(spec: Any) -> List[str]:
+    return [o.name for o in spec.description.output]
+
+
+def parse_args() -> argparse.Namespace:
+    root = Path(__file__).resolve().parents[1]
+    p = argparse.ArgumentParser(description="Export pure CoreML Cohere ASR pipeline: frontend + encoder + decoder.")
+    p.add_argument("--model-id", default=DEFAULT_MODEL)
+    p.add_argument("--language", default="en")
+    p.add_argument("--punctuation", action="store_true", default=True)
+    p.add_argument("--max-new-tokens", type=int, default=96)
+    p.add_argument("--max-audio-seconds", type=float, default=30.0)
+    p.add_argument("--artifacts-dir", default=str(root / "artifacts"))
+    p.add_argument("--report-json", default=str(root / "reports" / "export_pure_coreml_report.json"))
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    token = os.getenv("HF_TOKEN")
+
+    processor = AutoProcessor.from_pretrained(args.model_id, trust_remote_code=True, token=token)
+    model = AutoModelForSpeechSeq2Seq.from_pretrained(args.model_id, trust_remote_code=True, token=token).eval()
+    patch_model_for_tracing(model)
+
+    fe = processor.feature_extractor
+    fb = fe.filterbank
+    sample_rate = int(fe.sampling_rate)
+    max_audio_samples = int(sample_rate * float(args.max_audio_seconds))
+
+    frontend = FrontendCore(
+        mel_fb=fb.fb.detach().to(torch.float32),
+        window=fb.window.detach().to(torch.float32),
+        n_fft=int(fb.n_fft),
+        win_length=int(fb.win_length),
+        hop_length=int(fb.hop_length),
+        preemph=float(fb.preemph if fb.preemph is not None else 0.97),
+        pad_to=int(fb.pad_to),
+        log_zero_guard_value=float(fb.log_zero_guard_value_fn(torch.tensor(1.0))),
+        mag_power=float(fb.mag_power),
+    ).eval()
+
+    dummy_audio = torch.zeros((1, max_audio_samples), dtype=torch.float32)
+    dummy_audio_len = torch.tensor([max_audio_samples], dtype=torch.int32)
+    with torch.no_grad():
+        dummy_features, dummy_feat_len = frontend(dummy_audio, dummy_audio_len)
+    max_feature_frames = int(dummy_features.shape[2])
+
+    encoder = EncoderCore(model).eval()
+    with torch.no_grad():
+        dummy_encoder_hidden, dummy_encoder_len = encoder(dummy_features, dummy_feat_len)
+    max_encoder_frames = int(dummy_encoder_hidden.shape[1])
+    encoder_hidden_size = int(dummy_encoder_hidden.shape[2])
+
+    prompt_text = model.build_prompt(language=args.language, punctuation=args.punctuation)
+    prompt_inputs = processor(audio=[np.zeros(1600, dtype=np.float32)], text=[prompt_text], sampling_rate=sample_rate, return_tensors="pt")
+    prompt_ids = prompt_inputs["input_ids"][0].to(torch.int32)
+    decoder_max_len = int(prompt_ids.shape[0]) + int(args.max_new_tokens) + 2
+
+    decoder = FullSeqDecoderMasked(model).eval()
+    dummy_input_ids = torch.full((1, decoder_max_len), fill_value=int(processor.tokenizer.pad_token_id), dtype=torch.int32)
+    dummy_dec_mask = torch.zeros((1, decoder_max_len), dtype=torch.int32)
+    dummy_cross_mask = torch.zeros((1, 1, 1, max_encoder_frames), dtype=torch.float32)
+    with torch.no_grad():
+        _ = decoder(dummy_encoder_hidden, dummy_input_ids, dummy_dec_mask, dummy_cross_mask)
+
+    front_traced = torch.jit.trace(frontend, (dummy_audio, dummy_audio_len), strict=False, check_trace=False)
+    enc_traced = torch.jit.trace(encoder, (dummy_features, dummy_feat_len), strict=False, check_trace=False)
+    dec_traced = torch.jit.trace(
+        decoder,
+        (dummy_encoder_hidden, dummy_input_ids, dummy_dec_mask, dummy_cross_mask),
+        strict=False,
+        check_trace=False,
+    )
+
+    artifacts_dir = Path(args.artifacts_dir)
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+    frontend_pkg = artifacts_dir / "cohere_frontend.mlpackage"
+    encoder_pkg = artifacts_dir / "cohere_encoder.mlpackage"
+    decoder_pkg = artifacts_dir / "cohere_decoder_fullseq_masked.mlpackage"
+    manifest_path = artifacts_dir / "coreml_manifest.json"
+
+    frontend_model = ct.convert(
+        front_traced,
+        convert_to="mlprogram",
+        minimum_deployment_target=ct.target.macOS13,
+        compute_units=ct.ComputeUnit.CPU_AND_NE,
+        compute_precision=ct.precision.FLOAT32,
+        inputs=[
+            ct.TensorType(name="audio_samples", shape=tuple(dummy_audio.shape), dtype=np.float32),
+            ct.TensorType(name="audio_length", shape=tuple(dummy_audio_len.shape), dtype=np.int32),
+        ],
+    )
+    frontend_model.save(str(frontend_pkg))
+
+    encoder_model = ct.convert(
+        enc_traced,
+        convert_to="mlprogram",
+        minimum_deployment_target=ct.target.macOS13,
+        compute_units=ct.ComputeUnit.CPU_AND_NE,
+        compute_precision=ct.precision.FLOAT32,
+        inputs=[
+            ct.TensorType(name="input_features", shape=tuple(dummy_features.shape), dtype=np.float32),
+            ct.TensorType(name="feature_length", shape=tuple(dummy_feat_len.shape), dtype=np.int32),
+        ],
+    )
+    encoder_model.save(str(encoder_pkg))
+
+    decoder_model = ct.convert(
+        dec_traced,
+        convert_to="mlprogram",
+        minimum_deployment_target=ct.target.macOS13,
+        compute_units=ct.ComputeUnit.CPU_AND_NE,
+        compute_precision=ct.precision.FLOAT32,
+        inputs=[
+            ct.TensorType(name="encoder_hidden_states", shape=tuple(dummy_encoder_hidden.shape), dtype=np.float32),
+            ct.TensorType(name="input_ids", shape=tuple(dummy_input_ids.shape), dtype=np.int32),
+            ct.TensorType(name="decoder_attention_mask", shape=tuple(dummy_dec_mask.shape), dtype=np.int32),
+            ct.TensorType(name="cross_attention_mask", shape=tuple(dummy_cross_mask.shape), dtype=np.float32),
+        ],
+    )
+    decoder_model.save(str(decoder_pkg))
+
+    manifest: Dict[str, Any] = {
+        "model_id": args.model_id,
+        "sample_rate": sample_rate,
+        "max_audio_samples": max_audio_samples,
+        "max_feature_frames": max_feature_frames,
+        "max_encoder_frames": max_encoder_frames,
+        "encoder_hidden_size": encoder_hidden_size,
+        "decoder_max_len": decoder_max_len,
+        "default_max_new_tokens": int(args.max_new_tokens),
+        "prompt_ids": [int(x) for x in prompt_ids.tolist()],
+        "eos_token_id": int(processor.tokenizer.eos_token_id) if processor.tokenizer.eos_token_id is not None else None,
+        "pad_token_id": int(processor.tokenizer.pad_token_id) if processor.tokenizer.pad_token_id is not None else None,
+        "id_to_token": processor.tokenizer.convert_ids_to_tokens(list(range(processor.tokenizer.vocab_size))),
+        "frontend": {
+            "package": frontend_pkg.name,
+            "inputs": ["audio_samples", "audio_length"],
+            "outputs": _pick_output_names(frontend_model.get_spec()),
+        },
+        "encoder": {
+            "package": encoder_pkg.name,
+            "inputs": ["input_features", "feature_length"],
+            "outputs": _pick_output_names(encoder_model.get_spec()),
+        },
+        "decoder": {
+            "package": decoder_pkg.name,
+            "inputs": ["encoder_hidden_states", "input_ids", "decoder_attention_mask", "cross_attention_mask"],
+            "outputs": _pick_output_names(decoder_model.get_spec()),
+        },
+    }
+    with manifest_path.open("w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+
+    report = {
+        "frontend_package": str(frontend_pkg),
+        "encoder_package": str(encoder_pkg),
+        "decoder_package": str(decoder_pkg),
+        "manifest_json": str(manifest_path),
+        "max_audio_samples": max_audio_samples,
+        "max_feature_frames": max_feature_frames,
+        "max_encoder_frames": max_encoder_frames,
+        "decoder_max_len": decoder_max_len,
+    }
+    report_path = Path(args.report_json)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    with report_path.open("w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+    print(json.dumps(report, indent=2))
+
+
+if __name__ == "__main__":
+    main()
