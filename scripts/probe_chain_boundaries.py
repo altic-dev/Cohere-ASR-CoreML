@@ -11,7 +11,7 @@ import soundfile as sf
 import torch
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 
-from export_coreml_pure_pipeline import EncoderCore, FrontendCore, FullSeqDecoderMasked, patch_model_for_tracing
+from export_coreml_pure_pipeline import EncoderCore, FrontendCore, FullSeqDecoderMasked, apply_preemph, patch_model_for_tracing
 
 
 DEFAULT_MODEL = "CohereLabs/cohere-transcribe-03-2026"
@@ -177,11 +177,14 @@ def main() -> None:
     processor, torch_front, torch_enc, torch_dec = build_torch(args.model_id, token)
     coreml = load_coreml_models(artifacts_dir, manifest, args.compute)
 
+    preemph_coeff = manifest.get("preemph", 0.97)
+    audio_t = torch.from_numpy(audio[None, :].astype(np.float32))
+    length_t = torch.tensor([raw_length], dtype=torch.int32)
+    preemph_audio_t = apply_preemph(audio_t, length_t, preemph_coeff)
+    preemph_audio_np = preemph_audio_t.numpy()[0]
+
     with torch.no_grad():
-        torch_feat_t, torch_feat_len_t = torch_front(
-            torch.from_numpy(audio[None, :].astype(np.float32)),
-            torch.tensor([raw_length], dtype=torch.int32),
-        )
+        torch_feat_t, torch_feat_len_t = torch_front(preemph_audio_t, length_t)
     torch_feat = torch_feat_t.detach().cpu().numpy().astype(np.float32)
     torch_feat_len = torch_feat_len_t.detach().cpu().numpy().astype(np.int32)
 
@@ -189,11 +192,11 @@ def main() -> None:
         enc_h, enc_len = coreml_encoder_predict(coreml["encoder"], manifest, torch_feat, torch_feat_len)
         generated = decode_coreml(coreml["decoder"], manifest, enc_h.astype(np.float32), int(round(float(np.asarray(enc_len)[0]))))
     elif args.probe == "coreml_front_coreml_enc_coreml_dec":
-        feat, feat_len = coreml_frontend_predict(coreml["frontend"], manifest, audio, raw_length)
+        feat, feat_len = coreml_frontend_predict(coreml["frontend"], manifest, preemph_audio_np, raw_length)
         enc_h, enc_len = coreml_encoder_predict(coreml["encoder"], manifest, feat, np.asarray(feat_len, dtype=np.int32))
         generated = decode_coreml(coreml["decoder"], manifest, enc_h.astype(np.float32), int(round(float(np.asarray(enc_len)[0]))))
     else:
-        feat, feat_len = coreml_frontend_predict(coreml["frontend"], manifest, audio, raw_length)
+        feat, feat_len = coreml_frontend_predict(coreml["frontend"], manifest, preemph_audio_np, raw_length)
         with torch.no_grad():
             enc_h_t, enc_len_t = torch_enc(
                 torch.from_numpy(feat.astype(np.float32)),

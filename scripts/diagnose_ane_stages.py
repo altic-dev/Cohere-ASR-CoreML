@@ -11,7 +11,7 @@ import soundfile as sf
 import torch
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 
-from export_coreml_pure_pipeline import EncoderCore, FrontendCore, FullSeqDecoderMasked, patch_model_for_tracing
+from export_coreml_pure_pipeline import EncoderCore, FrontendCore, FullSeqDecoderMasked, apply_preemph, patch_model_for_tracing
 
 
 DEFAULT_MODEL = "CohereLabs/cohere-transcribe-03-2026"
@@ -190,11 +190,15 @@ def main() -> None:
     audio, raw_length = load_audio(audio_path, manifest["max_audio_samples"])
 
     processor, frontend_t, encoder_t, decoder_t = build_pytorch_modules(args.model_id, token)
+
+    preemph_coeff = manifest.get("preemph", 0.97)
+    audio_t = torch.from_numpy(audio[None, :].astype(np.float32))
+    length_t = torch.tensor([raw_length], dtype=torch.int32)
+    preemph_audio_t = apply_preemph(audio_t, length_t, preemph_coeff)
+    preemph_audio_np = preemph_audio_t.numpy()[0]
+
     with torch.no_grad():
-        pyt_feat_t, pyt_feat_len_t = frontend_t(
-            torch.from_numpy(audio[None, :].astype(np.float32)),
-            torch.tensor([raw_length], dtype=torch.int32),
-        )
+        pyt_feat_t, pyt_feat_len_t = frontend_t(preemph_audio_t, length_t)
         pyt_enc_t, pyt_enc_len_t = encoder_t(pyt_feat_t, pyt_feat_len_t)
 
     pyt_feat = pyt_feat_t.detach().cpu().numpy().astype(np.float32)
@@ -205,8 +209,8 @@ def main() -> None:
     cpu_models = load_coreml_models(artifacts_dir, manifest, ct.ComputeUnit.CPU_ONLY)
     ane_models = load_coreml_models(artifacts_dir, manifest, ct.ComputeUnit.CPU_AND_NE)
 
-    cpu_feat, cpu_feat_len = coreml_frontend_predict(cpu_models["frontend"], manifest, audio, raw_length)
-    ane_feat, ane_feat_len = coreml_frontend_predict(ane_models["frontend"], manifest, audio, raw_length)
+    cpu_feat, cpu_feat_len = coreml_frontend_predict(cpu_models["frontend"], manifest, preemph_audio_np, raw_length)
+    ane_feat, ane_feat_len = coreml_frontend_predict(ane_models["frontend"], manifest, preemph_audio_np, raw_length)
 
     cpu_enc_from_pyt, cpu_enc_len_from_pyt = coreml_encoder_predict(cpu_models["encoder"], manifest, pyt_feat, pyt_feat_len)
     ane_enc_from_pyt, ane_enc_len_from_pyt = coreml_encoder_predict(ane_models["encoder"], manifest, pyt_feat, pyt_feat_len)

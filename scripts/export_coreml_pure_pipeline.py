@@ -15,6 +15,53 @@ from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 DEFAULT_MODEL = "CohereLabs/cohere-transcribe-03-2026"
 
 
+def _build_stft_conv_weights(n_fft: int, win_length: int, window: torch.Tensor) -> torch.Tensor:
+    """Build conv1d weights that implement windowed DFT.
+
+    Returns weights of shape [2 * n_bins, 1, n_fft] where the first n_bins
+    filters are the cosine (real) components and the next n_bins are the sine
+    (imaginary) components, each pre-multiplied by the analysis window.
+    """
+    n_bins = n_fft // 2 + 1
+    full_window = torch.zeros(n_fft, dtype=torch.float64)
+    pad_left = (n_fft - win_length) // 2
+    full_window[pad_left : pad_left + win_length] = window.to(torch.float64)
+
+    k = torch.arange(n_bins, dtype=torch.float64)
+    n = torch.arange(n_fft, dtype=torch.float64)
+    angles = -2.0 * torch.pi * k.unsqueeze(1) * n.unsqueeze(0) / n_fft  # [n_bins, n_fft]
+    cos_part = torch.cos(angles) * full_window.unsqueeze(0)  # [n_bins, n_fft]
+    sin_part = torch.sin(angles) * full_window.unsqueeze(0)  # [n_bins, n_fft]
+    weights = torch.cat([cos_part, sin_part], dim=0)  # [2*n_bins, n_fft]
+    return weights.unsqueeze(1).to(torch.float32)  # [2*n_bins, 1, n_fft]
+
+
+def apply_preemph(
+    audio: torch.Tensor, length: torch.Tensor, preemph: float
+) -> torch.Tensor:
+    """Apply pre-emphasis and zero-mask beyond valid length.
+
+    Must be called on raw audio *before* passing to FrontendCore so that
+    CoreML's graph optimizer cannot fuse the multiply with the STFT conv1d
+    (which causes non-determinism).
+
+    Args:
+        audio: [B, T] raw audio samples.
+        length: [B] number of valid samples per utterance.
+        preemph: pre-emphasis coefficient (typically 0.97).
+
+    Returns:
+        [B, T] pre-emphasized, zero-masked audio.
+    """
+    x = audio.to(torch.float32)
+    mask = (
+        torch.arange(x.shape[1], device=x.device).unsqueeze(0)
+        < length.to(torch.int32).unsqueeze(1)
+    ).to(x.dtype)
+    x = torch.cat((x[:, 0].unsqueeze(1), x[:, 1:] - preemph * x[:, :-1]), dim=1)
+    return x * mask
+
+
 class FrontendCore(torch.nn.Module):
     def __init__(
         self,
@@ -29,10 +76,16 @@ class FrontendCore(torch.nn.Module):
         mag_power: float,
     ):
         super().__init__()
-        self.register_buffer("mel_fb", mel_fb.to(torch.float32))
-        self.register_buffer("window", window.to(torch.float32))
-        self.n_fft = int(n_fft)
-        self.win_length = int(win_length)
+        # mel_fb [1, n_mels, n_fft_bins] → conv1d weights [n_mels, n_fft_bins, 1]
+        mel_fb_f32 = mel_fb.to(torch.float32)
+        self.register_buffer("mel_conv_w", mel_fb_f32.squeeze(0).unsqueeze(2))
+        n_fft = int(n_fft)
+        win_length = int(win_length)
+        stft_weights = _build_stft_conv_weights(n_fft, win_length, window)
+        self.register_buffer("stft_weights", stft_weights)  # [2*n_bins, 1, n_fft]
+        self.n_fft = n_fft
+        self.n_bins = n_fft // 2 + 1
+        self.win_length = win_length
         self.hop_length = int(hop_length)
         self.preemph = float(preemph)
         self.pad_to = int(pad_to)
@@ -40,49 +93,61 @@ class FrontendCore(torch.nn.Module):
         self.mag_power = float(mag_power)
 
     def get_seq_len(self, seq_len: torch.Tensor) -> torch.Tensor:
-        # Matches feature extractor logic for non-exact-pad path.
         return torch.floor_divide(seq_len, self.hop_length).to(dtype=torch.int32)
 
+    def _conv1d_stft_mag(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute STFT magnitude via conv1d (deterministic in CoreML).
+
+        Equivalent to:
+            stft = torch.stft(x, n_fft, hop_length, win_length, center=True,
+                              window=window, return_complex=True, pad_mode='constant')
+            mag = sqrt(real**2 + imag**2)
+        """
+        pad_amount = self.n_fft // 2
+        x_padded = torch.nn.functional.pad(x, (pad_amount, pad_amount), mode="constant", value=0.0)
+        # x_padded: [B, L_padded] -> need [B, 1, L_padded] for conv1d
+        spec = torch.nn.functional.conv1d(
+            x_padded.unsqueeze(1), self.stft_weights, stride=self.hop_length
+        )
+        # spec: [B, 2*n_bins, num_frames]
+        real = spec[:, : self.n_bins, :]
+        imag = spec[:, self.n_bins :, :]
+        return torch.sqrt(real * real + imag * imag)  # [B, n_bins, num_frames]
+
     def forward(self, audio_samples: torch.Tensor, audio_length: torch.Tensor):
-        # audio_samples: [1, max_audio_samples], float32
-        # audio_length: [1], int32
+        """Expects pre-emphasized, zero-masked audio (see ``apply_preemph``)."""
         x = audio_samples.to(torch.float32)
         seq_len_time = audio_length.to(torch.int32)
 
-        time_mask = torch.arange(x.shape[1], device=x.device).unsqueeze(0) < seq_len_time.unsqueeze(1)
-        x = torch.cat((x[:, 0].unsqueeze(1), x[:, 1:] - self.preemph * x[:, :-1]), dim=1)
-        x = x.masked_fill(~time_mask, 0.0)
-
-        stft = torch.stft(
-            x,
-            n_fft=self.n_fft,
-            hop_length=self.hop_length,
-            win_length=self.win_length,
-            center=True,
-            window=self.window.to(dtype=torch.float32, device=x.device),
-            return_complex=True,
-            pad_mode="constant",
-        )
-        mag = torch.sqrt(torch.view_as_real(stft).pow(2).sum(-1))
+        mag = self._conv1d_stft_mag(x)
         if self.mag_power != 1.0:
             mag = mag.pow(self.mag_power)
-        mels = torch.matmul(self.mel_fb.to(dtype=mag.dtype), mag)
+        mels = torch.nn.functional.conv1d(mag, self.mel_conv_w)
         mels = torch.log(mels + self.log_zero_guard_value)
 
         seq_len = self.get_seq_len(seq_len_time)
+
+        # Per-utterance normalization (mean/var over valid frames).
+        # Implemented as sequential loop over mel channels to avoid non-deterministic
+        # large reductions in CoreML. The loop is unrolled during tracing.
+        n_mels = mels.shape[1]
         max_time = mels.shape[2]
-        valid = torch.arange(max_time, device=mels.device).unsqueeze(0) < seq_len.unsqueeze(1)
+        valid_f = (torch.arange(max_time, device=mels.device).unsqueeze(0) < seq_len.unsqueeze(1)).to(mels.dtype)
+        count = torch.clamp(seq_len.to(mels.dtype), min=1.0)
 
-        mean_num = torch.where(valid.unsqueeze(1), mels, torch.zeros_like(mels)).sum(axis=2)
-        mean_den = torch.clamp(seq_len.to(mels.dtype), min=1.0)
-        mean = mean_num / mean_den.unsqueeze(1)
-        var = torch.where(valid.unsqueeze(1), (mels - mean.unsqueeze(2)) ** 2, torch.zeros_like(mels)).sum(axis=2)
-        var = var / torch.clamp(mean_den.unsqueeze(1) - 1.0, min=1.0)
-        std = torch.sqrt(var)
-        std = std.masked_fill(std.isnan(), 0.0) + 1e-5
-        mels = (mels - mean.unsqueeze(2)) / std.unsqueeze(2)
-
-        mels = mels.masked_fill(~valid.unsqueeze(1), 0.0)
+        normed_channels = []
+        for c in range(n_mels):
+            ch = mels[:, c, :]  # [B, T]
+            masked = ch * valid_f  # [B, T]
+            ch_sum = masked.sum(dim=-1, keepdim=True)  # [B, 1]
+            ch_mean = ch_sum / count.unsqueeze(1)
+            diff = (ch - ch_mean) * valid_f
+            var_sum = (diff * diff).sum(dim=-1, keepdim=True)
+            ch_var = var_sum / torch.clamp(count.unsqueeze(1) - 1.0, min=1.0)
+            ch_std = torch.sqrt(ch_var + 1e-10) + 1e-5
+            normed = (ch - ch_mean) / ch_std * valid_f
+            normed_channels.append(normed.unsqueeze(1))
+        mels = torch.cat(normed_channels, dim=1)
 
         if self.pad_to > 0:
             pad_amt = mels.shape[2] % self.pad_to
@@ -216,8 +281,10 @@ def main() -> None:
         mag_power=float(fb.mag_power),
     ).eval()
 
-    dummy_audio = torch.zeros((1, max_audio_samples), dtype=torch.float32)
+    preemph_coeff = frontend.preemph
+    dummy_audio_raw = torch.zeros((1, max_audio_samples), dtype=torch.float32)
     dummy_audio_len = torch.tensor([max_audio_samples], dtype=torch.int32)
+    dummy_audio = apply_preemph(dummy_audio_raw, dummy_audio_len, preemph_coeff)
     with torch.no_grad():
         dummy_features, dummy_feat_len = frontend(dummy_audio, dummy_audio_len)
     max_feature_frames = int(dummy_features.shape[2])
@@ -301,6 +368,7 @@ def main() -> None:
     manifest: Dict[str, Any] = {
         "model_id": args.model_id,
         "sample_rate": sample_rate,
+        "preemph": preemph_coeff,
         "max_audio_samples": max_audio_samples,
         "max_feature_frames": max_feature_frames,
         "max_encoder_frames": max_encoder_frames,

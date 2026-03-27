@@ -4,6 +4,7 @@ import Foundation
 
 struct Manifest: Decodable {
     let sample_rate: Int
+    let preemph: Float?
     let max_audio_samples: Int
     let max_feature_frames: Int
     let max_encoder_frames: Int
@@ -189,6 +190,18 @@ func readAudioMono16k(path: String, targetSampleRate: Int) throws -> [Float] {
     return Array(UnsafeBufferPointer(start: channel, count: count))
 }
 
+func applyPreemphasis(_ audio: inout [Float], rawLength: Int, coeff: Float) {
+    let count = min(rawLength, audio.count)
+    if count > 1 {
+        for i in stride(from: count - 1, through: 1, by: -1) {
+            audio[i] = audio[i] - coeff * audio[i - 1]
+        }
+    }
+    for i in count..<audio.count {
+        audio[i] = 0.0
+    }
+}
+
 func argmaxSlice(_ arr: MLMultiArray, tokenIndex: Int, vocabSize: Int) -> Int32 {
     // Respect tensor strides; output is [1, T, V] but not guaranteed contiguous.
     let strideT = arr.strides[1].intValue
@@ -311,6 +324,8 @@ struct Main {
         } else if audio.count < manifest.max_audio_samples {
             audio += Array(repeating: 0.0, count: manifest.max_audio_samples - audio.count)
         }
+        let preemphCoeff = manifest.preemph ?? 0.97
+        applyPreemphasis(&audio, rawLength: rawLength, coeff: preemphCoeff)
         let audioMs = Date().timeIntervalSince(tAudio0) * 1000
 
         let audioArr = try makeFloatArray(shape: [1, manifest.max_audio_samples], values: audio)
