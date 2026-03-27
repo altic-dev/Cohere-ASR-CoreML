@@ -522,10 +522,19 @@ struct Main {
             let cacheType: MLMultiArrayDataType = manifest.isFp16 ? .float16 : .float32
             let cacheBytesPerElem = manifest.isFp16 ? 2 : 4
 
-            var cacheK = try MLMultiArray(shape: cacheShape, dataType: cacheType)
-            var cacheV = try MLMultiArray(shape: cacheShape, dataType: cacheType)
-            memset(cacheK.dataPointer, 0, cacheSize * cacheBytesPerElem)
-            memset(cacheV.dataPointer, 0, cacheSize * cacheBytesPerElem)
+            let vocabSize = manifest.id_to_token.count
+            let logitsShape = [1, vocabSize] as [NSNumber]
+
+            // Double-buffered caches: A and B swap each step
+            var cacheKA = try MLMultiArray(shape: cacheShape, dataType: cacheType)
+            var cacheVA = try MLMultiArray(shape: cacheShape, dataType: cacheType)
+            var cacheKB = try MLMultiArray(shape: cacheShape, dataType: cacheType)
+            var cacheVB = try MLMultiArray(shape: cacheShape, dataType: cacheType)
+            let logitsBuf = try MLMultiArray(shape: logitsShape, dataType: cacheType)
+            memset(cacheKA.dataPointer, 0, cacheSize * cacheBytesPerElem)
+            memset(cacheVA.dataPointer, 0, cacheSize * cacheBytesPerElem)
+
+            var useA = true  // current input caches are A
 
             var crossMaskValues = Array(repeating: Float(-1e9), count: manifest.max_encoder_frames)
             for i in 0..<encoderValid { crossMaskValues[i] = 0.0 }
@@ -542,28 +551,27 @@ struct Main {
             func runOneStep(tokenId: Int32, stepIdx: Int32) throws -> MLMultiArray {
                 inputIdArr[0] = NSNumber(value: tokenId)
                 stepArr[0] = NSNumber(value: stepIdx)
+                let inK = useA ? cacheKA : cacheKB
+                let inV = useA ? cacheVA : cacheVB
+                let outK = useA ? cacheKB : cacheKA
+                let outV = useA ? cacheVB : cacheVA
                 let decInputs = try MLDictionaryFeatureProvider(dictionary: [
                     "encoder_hidden_states": MLFeatureValue(multiArray: encoderHiddenF32),
                     "input_id": MLFeatureValue(multiArray: inputIdArr),
-                    "cache_k": MLFeatureValue(multiArray: cacheK),
-                    "cache_v": MLFeatureValue(multiArray: cacheV),
+                    "cache_k": MLFeatureValue(multiArray: inK),
+                    "cache_v": MLFeatureValue(multiArray: inV),
                     "step": MLFeatureValue(multiArray: stepArr),
                     "cross_attention_mask": MLFeatureValue(multiArray: crossMaskArr),
                 ])
-                let decOut = try decoderModel.prediction(from: decInputs)
-                guard let logits = decOut.featureValue(for: dc.logits_output)?.multiArrayValue,
-                      let newCK = decOut.featureValue(for: dc.cache_k_output)?.multiArrayValue,
-                      let newCV = decOut.featureValue(for: dc.cache_v_output)?.multiArrayValue else {
-                    throw NSError(domain: "pure_coreml_asr_cli", code: 15, userInfo: [NSLocalizedDescriptionKey: "Cached decoder outputs missing"])
-                }
-                let nextK = try MLMultiArray(shape: cacheShape, dataType: cacheType)
-                let nextV = try MLMultiArray(shape: cacheShape, dataType: cacheType)
-                memcpy(nextK.dataPointer, newCK.dataPointer, cacheSize * cacheBytesPerElem)
-                memcpy(nextV.dataPointer, newCV.dataPointer, cacheSize * cacheBytesPerElem)
-                // Note: newCK/newCV might not be contiguous; if issues persist, use toContiguous
-                cacheK = nextK
-                cacheV = nextV
-                return logits
+                let opts = MLPredictionOptions()
+                opts.outputBackings = [
+                    dc.logits_output: logitsBuf,
+                    dc.cache_k_output: outK,
+                    dc.cache_v_output: outV,
+                ]
+                _ = try decoderModel.prediction(from: decInputs, options: opts)
+                useA = !useA
+                return logitsBuf
             }
 
             var stepTopTokens: [Int32] = []
