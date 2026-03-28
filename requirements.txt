@@ -8,3 +8,5 @@ numpy==1.26.4
 sentencepiece==0.2.0
 librosa==0.10.2.post1
 scikit-learn==1.5.1
+datasets>=2.16.0
+jiwer>=3.0.0

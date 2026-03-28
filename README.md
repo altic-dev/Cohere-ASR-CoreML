@@ -130,6 +130,28 @@ Use `--reexport` only when model/export code changes.
 HF_TOKEN=... python scripts/validate_pure_coreml_cli.py --reexport ...
 ```
 
+## LibriSpeech WER (HF dataset)
+
+The [openslr/librispeech_asr](https://huggingface.co/datasets/openslr/librispeech_asr) corpus is 16 kHz English read speech (CC BY 4.0), aligned with this project’s frontend sample rate.
+
+`scripts/eval_librispeech_wer.py` downloads a slice of the split (default: first 50 `test` utterances from config `clean`), runs `pure_coreml_asr_cli` per clip, and reports **corpus WER** with simple normalization (lower case, strip punctuation). Compare **Core ML weight settings** by pointing at different export trees:
+
+- `artifacts_fp16` — FP16 weights, no palettization (`--quantize none`)
+- `artifacts_palettize6` / `artifacts_palettize4` — 6-bit / 4-bit palettized encoder+decoder (see `export_coreml_pure_pipeline.py --quantize`)
+
+Use **`--compute gpu`** (or `ane` / `cpu`) consistently when comparing. **PyTorch** baseline (model loaded once per run, faster for large N): `--backend pytorch` and optional `--pytorch-dtype float16` on CUDA.
+
+```bash
+source .venv/bin/activate
+pip install -r requirements.txt   # includes datasets, jiwer
+cd swift_runner && swift build -c release && cd ..
+# Core ML: three conditions (slow: one Swift process per clip per condition)
+python scripts/eval_librispeech_wer.py --max-samples 50 --compute gpu --output-json reports/librispeech_wer.json
+# Full test-clean (thousands of clips): --max-samples -1  (long run)
+# PyTorch reference WER on same clips
+HF_TOKEN=... python scripts/eval_librispeech_wer.py --backend pytorch --max-samples 200
+```
+
 ## Disk Cleanup (CoreML temp)
 
 CoreML conversion/compile may leave large temporary files under `/private/var/folders/.../T`.
@@ -165,6 +187,7 @@ cd /Users/barathwajanandan/Documents/random_apps/cohere_coreml
   - `artifacts/cohere_encoder.mlpackage`
   - `artifacts/cohere_decoder_fullseq_masked.mlpackage`
   - `artifacts/coreml_manifest.json`
+- LibriSpeech WER summary: `reports/librispeech_wer.json`
 
 ## Current status
 

@@ -48,27 +48,18 @@ struct CachedDecoderMeta: Decodable {
 
 struct CliArgs {
     let audioPath: String
-    let audioListPath: String?
     let artifactsDir: String
     let compiledCacheDir: String
     let computeMode: String
     let decoderMode: String
     let traceJsonPath: String?
     let maxNewTokens: Int?
+    /// If set, overrides manifest `overlap_seconds` (or default 5s) for chunk stride.
     let overlapSecondsOverride: Double?
-
-    var audioPaths: [String] {
-        if let listPath = audioListPath {
-            let content = (try? String(contentsOfFile: listPath, encoding: .utf8)) ?? ""
-            return content.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
-        }
-        return [audioPath]
-    }
 }
 
 func parseArgs(_ args: [String]) throws -> CliArgs {
     var audioPath = ""
-    var audioListPath: String?
     var tracePath: String?
     var maxNewTokens: Int?
     var overlapSecondsOverride: Double?
@@ -85,11 +76,6 @@ func parseArgs(_ args: [String]) throws -> CliArgs {
         let key = args[i]
         if key == "--audio", i + 1 < args.count {
             audioPath = args[i + 1]
-            i += 2
-            continue
-        }
-        if key == "--audio-list", i + 1 < args.count {
-            audioListPath = args[i + 1]
             i += 2
             continue
         }
@@ -133,15 +119,14 @@ func parseArgs(_ args: [String]) throws -> CliArgs {
         ])
     }
 
-    if audioPath.isEmpty && audioListPath == nil {
+    if audioPath.isEmpty {
         throw NSError(domain: "pure_coreml_asr_cli", code: 3, userInfo: [
-            NSLocalizedDescriptionKey: "Usage: swift run pure_coreml_asr_cli --audio <path.wav> | --audio-list <paths.txt> [--trace-json <path>] [--max-new-tokens N] [--overlap-seconds SEC] [--artifacts-dir <path>] [--compiled-cache-dir <path>] [--compute cpu|gpu|ane|all]"
+            NSLocalizedDescriptionKey: "Usage: swift run pure_coreml_asr_cli --audio <path.wav> [--trace-json <path>] [--max-new-tokens N] [--overlap-seconds SEC] [--artifacts-dir <path>] [--compiled-cache-dir <path>] [--compute cpu|gpu|ane|all]"
         ])
     }
 
     return CliArgs(
         audioPath: audioPath,
-        audioListPath: audioListPath,
         artifactsDir: artifactsDir,
         compiledCacheDir: compiledCacheDir,
         computeMode: computeMode,
@@ -490,11 +475,9 @@ struct Main {
         let encoderModel = encoderLoaded.model
         let decoderModel = decoderLoaded.model
         let needsAnewarmup = cli.computeMode == "ane"
-        let allAudioPaths = cli.audioPaths
 
-        for audioFile in allAudioPaths {
         let tAudio0 = Date()
-        let fullAudio = try readAudioMono16k(path: audioFile, targetSampleRate: manifest.sample_rate)
+        let fullAudio = try readAudioMono16k(path: cli.audioPath, targetSampleRate: manifest.sample_rate)
         let audioMs = Date().timeIntervalSince(tAudio0) * 1000
         guard !fullAudio.isEmpty else {
             throw NSError(domain: "pure_coreml_asr_cli", code: 15, userInfo: [
@@ -755,7 +738,6 @@ struct Main {
         let used = lastUsed
         let stepTopTokens = lastStepTop
 
-        print("audio_file=\(audioFile)")
         print("load_ms=\(String(format: "%.2f", loadMs))")
         print("precision=\(manifest.precision ?? "float32")")
         print("quantize=\(manifest.quantize ?? "none")")
@@ -778,7 +760,7 @@ struct Main {
 
         if let tracePath = cli.traceJsonPath {
             let trace: [String: Any] = [
-                "audio_file": audioFile,
+                "audio_file": cli.audioPath,
                 "chunk_count": starts.count,
                 "overlap_samples": overlapSamples,
                 "chunk_texts": chunkTexts,
@@ -790,6 +772,5 @@ struct Main {
             try traceData.write(to: URL(fileURLWithPath: tracePath))
             print("trace_json=\(tracePath)")
         }
-        } // end for audioFile
     }
 }
