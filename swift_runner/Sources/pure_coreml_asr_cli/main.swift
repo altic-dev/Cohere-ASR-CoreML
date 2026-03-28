@@ -1,12 +1,17 @@
 @preconcurrency import AVFoundation
+import ChunkMergeCore
 import CoreML
 import Foundation
 
 struct Manifest: Decodable {
     let sample_rate: Int
     let precision: String?
+    let quantize: String?
     let preemph: Float?
     let max_audio_samples: Int
+    let max_audio_seconds: Double?
+    let overlap_seconds: Double?
+    let overlap_samples: Int?
     let max_feature_frames: Int
     let max_encoder_frames: Int
     let decoder_max_len: Int
@@ -49,12 +54,15 @@ struct CliArgs {
     let decoderMode: String
     let traceJsonPath: String?
     let maxNewTokens: Int?
+    /// If set, overrides manifest `overlap_seconds` (or default 5s) for chunk stride.
+    let overlapSecondsOverride: Double?
 }
 
 func parseArgs(_ args: [String]) throws -> CliArgs {
     var audioPath = ""
     var tracePath: String?
     var maxNewTokens: Int?
+    var overlapSecondsOverride: Double?
 
     let cwd = FileManager.default.currentDirectoryPath
     let defaultArtifacts = URL(fileURLWithPath: cwd).appendingPathComponent("../artifacts").path
@@ -101,6 +109,11 @@ func parseArgs(_ args: [String]) throws -> CliArgs {
             i += 2
             continue
         }
+        if key == "--overlap-seconds", i + 1 < args.count {
+            overlapSecondsOverride = Double(args[i + 1])
+            i += 2
+            continue
+        }
         throw NSError(domain: "pure_coreml_asr_cli", code: 2, userInfo: [
             NSLocalizedDescriptionKey: "Unknown or incomplete argument: \(key)"
         ])
@@ -108,7 +121,7 @@ func parseArgs(_ args: [String]) throws -> CliArgs {
 
     if audioPath.isEmpty {
         throw NSError(domain: "pure_coreml_asr_cli", code: 3, userInfo: [
-            NSLocalizedDescriptionKey: "Usage: swift run pure_coreml_asr_cli --audio <path.wav> [--trace-json <path>] [--max-new-tokens N] [--artifacts-dir <path>] [--compiled-cache-dir <path>] [--compute cpu|gpu|ane|all]"
+            NSLocalizedDescriptionKey: "Usage: swift run pure_coreml_asr_cli --audio <path.wav> [--trace-json <path>] [--max-new-tokens N] [--overlap-seconds SEC] [--artifacts-dir <path>] [--compiled-cache-dir <path>] [--compute cpu|gpu|ane|all]"
         ])
     }
 
@@ -119,13 +132,30 @@ func parseArgs(_ args: [String]) throws -> CliArgs {
         computeMode: computeMode,
         decoderMode: decoderMode,
         traceJsonPath: tracePath,
-        maxNewTokens: maxNewTokens
+        maxNewTokens: maxNewTokens,
+        overlapSecondsOverride: overlapSecondsOverride
     )
 }
 
 func loadManifest(artifactsDir: String) throws -> Manifest {
     let manifestURL = URL(fileURLWithPath: artifactsDir).appendingPathComponent("coreml_manifest.json")
     return try JSONDecoder().decode(Manifest.self, from: Data(contentsOf: manifestURL))
+}
+
+/// Overlap stride for long audio: CLI override, else manifest `overlap_samples` / `overlap_seconds`, else 5s (PyTorch-style default).
+func effectiveOverlapSamples(manifest: Manifest, cli: CliArgs) -> Int {
+    let maxS = manifest.max_audio_samples
+    if maxS <= 1 { return 0 }
+    if let o = cli.overlapSecondsOverride {
+        let v = Int(round(Double(manifest.sample_rate) * o))
+        return min(max(0, v), maxS - 1)
+    }
+    if let os = manifest.overlap_samples, os >= 0 {
+        return min(os, maxS - 1)
+    }
+    let sec = manifest.overlap_seconds ?? 5.0
+    let v = Int(round(Double(manifest.sample_rate) * sec))
+    return min(max(0, v), maxS - 1)
 }
 
 func makeFloatArray(shape: [Int], values: [Float]) throws -> MLMultiArray {
@@ -210,6 +240,32 @@ func makeFloat16Array(shape: [Int], values: [Float]) throws -> MLMultiArray {
     return arr
 }
 
+final class FastFeatureProvider: MLFeatureProvider {
+    private var dict: [String: MLFeatureValue]
+    let featureNames: Set<String>
+
+    init(_ pairs: [(String, MLMultiArray)]) {
+        var d = [String: MLFeatureValue]()
+        d.reserveCapacity(pairs.count)
+        var names = Set<String>()
+        names.reserveCapacity(pairs.count)
+        for (k, v) in pairs {
+            d[k] = MLFeatureValue(multiArray: v)
+            names.insert(k)
+        }
+        self.dict = d
+        self.featureNames = names
+    }
+
+    func featureValue(for featureName: String) -> MLFeatureValue? {
+        dict[featureName]
+    }
+
+    func update(_ key: String, _ arr: MLMultiArray) {
+        dict[key] = MLFeatureValue(multiArray: arr)
+    }
+}
+
 func readAudioMono16k(path: String, targetSampleRate: Int) throws -> [Float] {
     let srcURL = URL(fileURLWithPath: path)
     let file = try AVAudioFile(forReading: srcURL)
@@ -277,13 +333,27 @@ func applyPreemphasis(_ audio: inout [Float], rawLength: Int, coeff: Float) {
 }
 
 func argmax1D(_ arr: MLMultiArray) -> Int32 {
-    var best = arr[0].doubleValue
-    var bestIdx = 0
-    for i in 1..<arr.count {
-        let v = arr[i].doubleValue
-        if v > best { best = v; bestIdx = i }
+    let count = arr.count
+    if arr.dataType == .float16 {
+        let ptr = arr.dataPointer.bindMemory(to: UInt16.self, capacity: count)
+        var bestIdx = 0
+        var bestBits = ptr[0]
+        for i in 1..<count {
+            let bits = ptr[i]
+            if Float16(bitPattern: bits) > Float16(bitPattern: bestBits) {
+                bestBits = bits; bestIdx = i
+            }
+        }
+        return Int32(bestIdx)
+    } else {
+        let ptr = arr.dataPointer.bindMemory(to: Float.self, capacity: count)
+        var bestIdx = 0
+        var best = ptr[0]
+        for i in 1..<count {
+            if ptr[i] > best { best = ptr[i]; bestIdx = i }
+        }
+        return Int32(bestIdx)
     }
-    return Int32(bestIdx)
 }
 
 func argmaxSlice(_ arr: MLMultiArray, tokenIndex: Int, vocabSize: Int) -> Int32 {
@@ -407,25 +477,44 @@ struct Main {
         let needsAnewarmup = cli.computeMode == "ane"
 
         let tAudio0 = Date()
-        var audio = try readAudioMono16k(path: cli.audioPath, targetSampleRate: manifest.sample_rate)
-        let rawLength = min(audio.count, manifest.max_audio_samples)
-        if audio.count > manifest.max_audio_samples {
-            audio = Array(audio.prefix(manifest.max_audio_samples))
-        } else if audio.count < manifest.max_audio_samples {
-            audio += Array(repeating: 0.0, count: manifest.max_audio_samples - audio.count)
-        }
-        let preemphCoeff = manifest.preemph ?? 0.97
-        applyPreemphasis(&audio, rawLength: rawLength, coeff: preemphCoeff)
+        let fullAudio = try readAudioMono16k(path: cli.audioPath, targetSampleRate: manifest.sample_rate)
         let audioMs = Date().timeIntervalSince(tAudio0) * 1000
+        guard !fullAudio.isEmpty else {
+            throw NSError(domain: "pure_coreml_asr_cli", code: 15, userInfo: [
+                NSLocalizedDescriptionKey: "Decoded audio is empty",
+            ])
+        }
 
-        let audioArr = try makeFloatArray(shape: [1, manifest.max_audio_samples], values: audio)
-        let audioLenArr = try makeIntArray(shape: [1], values: [Int32(rawLength)])
-        let frontInputs = try MLDictionaryFeatureProvider(dictionary: [
-            manifest.frontend.inputs[0]: MLFeatureValue(multiArray: audioArr),
-            manifest.frontend.inputs[1]: MLFeatureValue(multiArray: audioLenArr),
-        ])
+        let preemphCoeff = manifest.preemph ?? 0.97
+        let overlapSamples = effectiveOverlapSamples(manifest: manifest, cli: cli)
+        let starts = ChunkMerge.windowStarts(
+            totalSamples: fullAudio.count,
+            windowSamples: manifest.max_audio_samples,
+            overlapSamples: overlapSamples
+        )
 
-        func runFrontendEncoder() throws -> (frontMs: Double, encMs: Double, encoderHiddenF32: MLMultiArray, encoderValid: Int) {
+        func buildFrontInputs(paddedAudio: [Float], rawLength: Int) throws -> MLDictionaryFeatureProvider {
+            let audioArr = try makeFloatArray(shape: [1, manifest.max_audio_samples], values: paddedAudio)
+            let audioLenArr = try makeIntArray(shape: [1], values: [Int32(rawLength)])
+            return try MLDictionaryFeatureProvider(dictionary: [
+                manifest.frontend.inputs[0]: MLFeatureValue(multiArray: audioArr),
+                manifest.frontend.inputs[1]: MLFeatureValue(multiArray: audioLenArr),
+            ])
+        }
+
+        func buildChunkAtIndex(_ chunkIndex: Int) throws -> MLDictionaryFeatureProvider {
+            let start = starts[chunkIndex]
+            let end = min(start + manifest.max_audio_samples, fullAudio.count)
+            var segment = Array(fullAudio[start..<end])
+            let rawLength = segment.count
+            if segment.count < manifest.max_audio_samples {
+                segment += Array(repeating: 0.0, count: manifest.max_audio_samples - segment.count)
+            }
+            applyPreemphasis(&segment, rawLength: rawLength, coeff: preemphCoeff)
+            return try buildFrontInputs(paddedAudio: segment, rawLength: rawLength)
+        }
+
+        func runFrontendEncoder(frontInputs: MLDictionaryFeatureProvider) throws -> (frontMs: Double, encMs: Double, encoderHiddenF32: MLMultiArray, encoderValid: Int) {
             let tFront0 = Date()
             let frontOut = try frontendModel.prediction(from: frontInputs)
             let frontMs = Date().timeIntervalSince(tFront0) * 1000
@@ -456,8 +545,8 @@ struct Main {
             return (frontMs, encMs, encoderHiddenF32, encoderValid)
         }
 
-        func runFullSeqPipeline() throws -> (frontMs: Double, encMs: Double, decMs: Double, used: [Int32], stepTopTokens: [Int32]) {
-            let fe = try runFrontendEncoder()
+        func runFullSeqPipeline(frontInputs: MLDictionaryFeatureProvider) throws -> (frontMs: Double, encMs: Double, decMs: Double, used: [Int32], stepTopTokens: [Int32]) {
+            let fe = try runFrontendEncoder(frontInputs: frontInputs)
             let encoderHiddenF32 = fe.encoderHiddenF32
             let encoderValid = fe.encoderValid
 
@@ -508,11 +597,11 @@ struct Main {
             return (fe.frontMs, fe.encMs, decMs, used, stepTopTokens)
         }
 
-        func runCachedPipeline() throws -> (frontMs: Double, encMs: Double, decMs: Double, used: [Int32], stepTopTokens: [Int32]) {
+        func runCachedPipeline(frontInputs: MLDictionaryFeatureProvider) throws -> (frontMs: Double, encMs: Double, decMs: Double, used: [Int32], stepTopTokens: [Int32]) {
             guard let dc = manifest.decoder_cached else {
                 throw NSError(domain: "pure_coreml_asr_cli", code: 14, userInfo: [NSLocalizedDescriptionKey: "decoder_cached not found in manifest"])
             }
-            let fe = try runFrontendEncoder()
+            let fe = try runFrontendEncoder(frontInputs: frontInputs)
             let encoderHiddenF32 = fe.encoderHiddenF32
             let encoderValid = fe.encoderValid
 
@@ -526,10 +615,10 @@ struct Main {
             let logitsShape = [1, vocabSize] as [NSNumber]
 
             // Double-buffered caches: A and B swap each step
-            var cacheKA = try MLMultiArray(shape: cacheShape, dataType: cacheType)
-            var cacheVA = try MLMultiArray(shape: cacheShape, dataType: cacheType)
-            var cacheKB = try MLMultiArray(shape: cacheShape, dataType: cacheType)
-            var cacheVB = try MLMultiArray(shape: cacheShape, dataType: cacheType)
+            let cacheKA = try MLMultiArray(shape: cacheShape, dataType: cacheType)
+            let cacheVA = try MLMultiArray(shape: cacheShape, dataType: cacheType)
+            let cacheKB = try MLMultiArray(shape: cacheShape, dataType: cacheType)
+            let cacheVB = try MLMultiArray(shape: cacheShape, dataType: cacheType)
             let logitsBuf = try MLMultiArray(shape: logitsShape, dataType: cacheType)
             memset(cacheKA.dataPointer, 0, cacheSize * cacheBytesPerElem)
             memset(cacheVA.dataPointer, 0, cacheSize * cacheBytesPerElem)
@@ -548,28 +637,37 @@ struct Main {
             let inputIdArr = try MLMultiArray(shape: [1, 1], dataType: .int32)
             let stepArr = try MLMultiArray(shape: [1], dataType: .int32)
 
+            let featureProvider = FastFeatureProvider([
+                ("encoder_hidden_states", encoderHiddenF32),
+                ("input_id", inputIdArr),
+                ("cache_k", cacheKA),
+                ("cache_v", cacheVA),
+                ("step", stepArr),
+                ("cross_attention_mask", crossMaskArr),
+            ])
+
+            let optsA = MLPredictionOptions()
+            optsA.outputBackings = [
+                dc.logits_output: logitsBuf,
+                dc.cache_k_output: cacheKB,
+                dc.cache_v_output: cacheVB,
+            ]
+            let optsB = MLPredictionOptions()
+            optsB.outputBackings = [
+                dc.logits_output: logitsBuf,
+                dc.cache_k_output: cacheKA,
+                dc.cache_v_output: cacheVA,
+            ]
+
             func runOneStep(tokenId: Int32, stepIdx: Int32) throws -> MLMultiArray {
                 inputIdArr[0] = NSNumber(value: tokenId)
                 stepArr[0] = NSNumber(value: stepIdx)
                 let inK = useA ? cacheKA : cacheKB
                 let inV = useA ? cacheVA : cacheVB
-                let outK = useA ? cacheKB : cacheKA
-                let outV = useA ? cacheVB : cacheVA
-                let decInputs = try MLDictionaryFeatureProvider(dictionary: [
-                    "encoder_hidden_states": MLFeatureValue(multiArray: encoderHiddenF32),
-                    "input_id": MLFeatureValue(multiArray: inputIdArr),
-                    "cache_k": MLFeatureValue(multiArray: inK),
-                    "cache_v": MLFeatureValue(multiArray: inV),
-                    "step": MLFeatureValue(multiArray: stepArr),
-                    "cross_attention_mask": MLFeatureValue(multiArray: crossMaskArr),
-                ])
-                let opts = MLPredictionOptions()
-                opts.outputBackings = [
-                    dc.logits_output: logitsBuf,
-                    dc.cache_k_output: outK,
-                    dc.cache_v_output: outV,
-                ]
-                _ = try decoderModel.prediction(from: decInputs, options: opts)
+                featureProvider.update("cache_k", inK)
+                featureProvider.update("cache_v", inV)
+                let opts = useA ? optsA : optsB
+                _ = try decoderModel.prediction(from: featureProvider, options: opts)
                 useA = !useA
                 return logitsBuf
             }
@@ -608,31 +706,54 @@ struct Main {
         }
 
         let runPipeline = useCached ? runCachedPipeline : runFullSeqPipeline
-        if needsAnewarmup {
-            _ = try runPipeline()
+        if needsAnewarmup, !starts.isEmpty {
+            _ = try runPipeline(try buildChunkAtIndex(0))
         }
 
-        let result = try runPipeline()
-        let frontMs = result.frontMs
-        let encMs = result.encMs
-        let decMs = result.decMs
-        let used = result.used
-        let stepTopTokens = result.stepTopTokens
-        let text = decodePieces(
-            ids: used,
-            vocab: manifest.id_to_token,
-            eos: manifest.eos_token_id,
-            pad: manifest.pad_token_id
-        )
+        var totalFrontMs = 0.0
+        var totalEncMs = 0.0
+        var totalDecMs = 0.0
+        var chunkTexts: [String] = []
+        var lastUsed: [Int32] = []
+        var lastStepTop: [Int32] = []
+
+        for chunkIdx in 0..<starts.count {
+            let fi = try buildChunkAtIndex(chunkIdx)
+            let result = try runPipeline(fi)
+            totalFrontMs += result.frontMs
+            totalEncMs += result.encMs
+            totalDecMs += result.decMs
+            lastUsed = result.used
+            lastStepTop = result.stepTopTokens
+            let chunkText = decodePieces(
+                ids: result.used,
+                vocab: manifest.id_to_token,
+                eos: manifest.eos_token_id,
+                pad: manifest.pad_token_id
+            )
+            chunkTexts.append(chunkText)
+        }
+
+        let text = ChunkMerge.mergeTranscriptChunks(chunkTexts)
+        let used = lastUsed
+        let stepTopTokens = lastStepTop
 
         print("load_ms=\(String(format: "%.2f", loadMs))")
         print("precision=\(manifest.precision ?? "float32")")
+        print("quantize=\(manifest.quantize ?? "none")")
         print("compute_mode=\(cli.computeMode)")
         print("decoder_mode=\(cli.decoderMode)")
         print("audio_ms=\(String(format: "%.2f", audioMs))")
-        print("frontend_ms=\(String(format: "%.2f", frontMs))")
-        print("encoder_ms=\(String(format: "%.2f", encMs))")
-        print("decoder_ms=\(String(format: "%.2f", decMs))")
+        print("chunk_count=\(starts.count)")
+        print("overlap_samples=\(overlapSamples)")
+        print("frontend_ms_total=\(String(format: "%.2f", totalFrontMs))")
+        print("encoder_ms_total=\(String(format: "%.2f", totalEncMs))")
+        print("decoder_ms_total=\(String(format: "%.2f", totalDecMs))")
+        if starts.count == 1 {
+            print("frontend_ms=\(String(format: "%.2f", totalFrontMs))")
+            print("encoder_ms=\(String(format: "%.2f", totalEncMs))")
+            print("decoder_ms=\(String(format: "%.2f", totalDecMs))")
+        }
         print("generated_token_count=\(used.count)")
         print("prompt_token_count=\(manifest.prompt_ids.count)")
         print("decoded_text=\(text)")
@@ -640,6 +761,9 @@ struct Main {
         if let tracePath = cli.traceJsonPath {
             let trace: [String: Any] = [
                 "audio_file": cli.audioPath,
+                "chunk_count": starts.count,
+                "overlap_samples": overlapSamples,
+                "chunk_texts": chunkTexts,
                 "generated_ids": used.map(Int.init),
                 "step_top_tokens": stepTopTokens.map(Int.init),
                 "decoded_text": text,

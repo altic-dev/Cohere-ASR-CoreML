@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 import coremltools as ct
+import coremltools.optimize.coreml as cto_coreml
 import numpy as np
 import torch
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
@@ -339,11 +340,75 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--punctuation", action="store_true", default=True)
     p.add_argument("--max-new-tokens", type=int, default=96)
     p.add_argument("--max-audio-seconds", type=float, default=30.0)
+    p.add_argument(
+        "--overlap-seconds",
+        type=float,
+        default=5.0,
+        help="Long-audio overlap between consecutive CoreML windows (seconds). Used for client-side "
+        "chunk+merge; align with PyTorch transcribe overlap_chunk_second when possible.",
+    )
     p.add_argument("--precision", choices=["float32", "float16"], default="float16",
                    help="Compute precision for encoder/decoder (frontend always fp32)")
+    p.add_argument("--quantize", choices=["none", "int8", "palettize4", "palettize6", "palettize4_int8lut"], default="none",
+                   help="Post-training weight compression: none, int8, palettize4 (4-bit LUT), "
+                        "palettize6 (6-bit LUT), palettize4_int8lut (4-bit LUT + int8 quant, Apple W4A8)")
     p.add_argument("--artifacts-dir", default=str(root / "artifacts"))
     p.add_argument("--report-json", default=str(root / "reports" / "export_pure_coreml_report.json"))
     return p.parse_args()
+
+
+def _quantize_int8(coreml_model, label: str):
+    """Apply per-channel symmetric int8 weight quantization to a CoreML model."""
+    print(f"  Quantizing {label} weights to int8 (per-channel symmetric)...")
+    op_config = cto_coreml.OpLinearQuantizerConfig(
+        mode="linear_symmetric",
+        weight_threshold=512,
+    )
+    config = cto_coreml.OptimizationConfig(global_config=op_config)
+    quantized = cto_coreml.linear_quantize_weights(coreml_model, config=config)
+    return quantized
+
+
+def _palettize(coreml_model, label: str, nbits: int):
+    """Apply n-bit palettization (weight clustering into 2^nbits centroids)."""
+    print(f"  Palettizing {label} weights to {nbits}-bit ({2**nbits} clusters)...")
+    op_config = cto_coreml.OpPalettizerConfig(
+        nbits=nbits,
+        weight_threshold=512,
+    )
+    config = cto_coreml.OptimizationConfig(global_config=op_config)
+    palettized = cto_coreml.palettize_weights(coreml_model, config=config)
+    return palettized
+
+
+def _palettize4_int8lut(coreml_model, label: str):
+    """Apple W4A8: 4-bit palettization then quantize LUT to int8 (joint compression)."""
+    print(f"  W4A8 joint compression on {label}: palettize 4-bit → int8 LUT...")
+    pal_config = cto_coreml.OptimizationConfig(
+        global_config=cto_coreml.OpPalettizerConfig(nbits=4, weight_threshold=512)
+    )
+    m = cto_coreml.palettize_weights(coreml_model, config=pal_config)
+    quant_config = cto_coreml.OptimizationConfig(
+        global_config=cto_coreml.OpLinearQuantizerConfig(
+            mode="linear_symmetric",
+            granularity="per_tensor",
+        )
+    )
+    m = cto_coreml.linear_quantize_weights(m, config=quant_config, joint_compression=True)
+    return m
+
+
+def _apply_compression(coreml_model, label: str, quantize: str):
+    """Dispatch to the right compression strategy based on --quantize flag."""
+    if quantize == "int8":
+        return _quantize_int8(coreml_model, label)
+    elif quantize == "palettize4":
+        return _palettize(coreml_model, label, nbits=4)
+    elif quantize == "palettize6":
+        return _palettize(coreml_model, label, nbits=6)
+    elif quantize == "palettize4_int8lut":
+        return _palettize4_int8lut(coreml_model, label)
+    return coreml_model
 
 
 def main() -> None:
@@ -358,6 +423,10 @@ def main() -> None:
     fb = fe.filterbank
     sample_rate = int(fe.sampling_rate)
     max_audio_samples = int(sample_rate * float(args.max_audio_seconds))
+    overlap_seconds = float(args.overlap_seconds)
+    overlap_samples = int(round(sample_rate * overlap_seconds))
+    if overlap_samples >= max_audio_samples:
+        overlap_samples = max(0, max_audio_samples - 1)
 
     frontend = FrontendCore(
         mel_fb=fb.fb.detach().to(torch.float32),
@@ -432,7 +501,8 @@ def main() -> None:
     use_fp16 = args.precision == "float16"
     model_precision = ct.precision.FLOAT16 if use_fp16 else ct.precision.FLOAT32
     float_dtype = np.float16 if use_fp16 else np.float32
-    min_target = ct.target.macOS13
+    needs_ios18 = args.quantize == "palettize4_int8lut"
+    min_target = ct.target.macOS15 if needs_ios18 else ct.target.macOS13
 
     frontend_pkg = artifacts_dir / "cohere_frontend.mlpackage"
     encoder_pkg = artifacts_dir / "cohere_encoder.mlpackage"
@@ -465,6 +535,8 @@ def main() -> None:
             ct.TensorType(name="feature_length", shape=tuple(dummy_feat_len.shape), dtype=np.int32),
         ],
     )
+    if args.quantize != "none":
+        encoder_model = _apply_compression(encoder_model, "encoder", args.quantize)
     encoder_model.save(str(encoder_pkg))
 
     decoder_model = ct.convert(
@@ -480,6 +552,8 @@ def main() -> None:
             ct.TensorType(name="cross_attention_mask", shape=tuple(dummy_cross_mask.shape), dtype=float_dtype),
         ],
     )
+    if args.quantize != "none":
+        decoder_model = _apply_compression(decoder_model, "fullseq_decoder", args.quantize)
     decoder_model.save(str(decoder_pkg))
 
     decoder_cached_model = ct.convert(
@@ -497,6 +571,8 @@ def main() -> None:
             ct.TensorType(name="cross_attention_mask", shape=(1, 1, 1, max_encoder_frames), dtype=float_dtype),
         ],
     )
+    if args.quantize != "none":
+        decoder_cached_model = _apply_compression(decoder_cached_model, "cached_decoder", args.quantize)
     decoder_cached_model.save(str(decoder_cached_pkg))
     cached_output_names = _pick_output_names(decoder_cached_model.get_spec())
     cache_elem_count = int(np.prod(dummy_cache_k.shape))
@@ -519,9 +595,13 @@ def main() -> None:
     manifest: Dict[str, Any] = {
         "model_id": args.model_id,
         "precision": args.precision,
+        "quantize": args.quantize,
         "sample_rate": sample_rate,
         "preemph": preemph_coeff,
         "max_audio_samples": max_audio_samples,
+        "max_audio_seconds": float(args.max_audio_seconds),
+        "overlap_seconds": overlap_seconds,
+        "overlap_samples": overlap_samples,
         "max_feature_frames": max_feature_frames,
         "max_encoder_frames": max_encoder_frames,
         "encoder_hidden_size": encoder_hidden_size,
@@ -568,6 +648,9 @@ def main() -> None:
         "decoder_cached_package": str(decoder_cached_pkg),
         "manifest_json": str(manifest_path),
         "max_audio_samples": max_audio_samples,
+        "max_audio_seconds": float(args.max_audio_seconds),
+        "overlap_seconds": overlap_seconds,
+        "overlap_samples": overlap_samples,
         "max_feature_frames": max_feature_frames,
         "max_encoder_frames": max_encoder_frames,
         "decoder_max_len": decoder_max_len,

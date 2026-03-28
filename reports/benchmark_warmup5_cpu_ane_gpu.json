@@ -1,0 +1,99 @@
+{
+  "note": "Warmup runs load/compile caches; timed runs average infer_ms. infer_ms = frontend_ms_total+encoder_ms_total+decoder_ms_total (long audio) or per-stage ms without _total. total_wall_ms_avg = load_ms + audio_ms + infer_ms (from CLI counters). After warmup, load_ms should be small if compiled-cache-dir is stable.",
+  "warmup_runs": 1,
+  "timed_runs": 5,
+  "overlap_seconds": 5.0,
+  "compiled_cache_dir": "/Users/bsubramaniam/Documents/personal/Cohere-ASR-CoreML/artifacts_fp16/.compiled",
+  "by_compute": {
+    "cpu": [
+      {
+        "audio": "example_10_min_ASR.mp3",
+        "duration_sec": 618.2081,
+        "infer_ms_avg": 32332.55,
+        "infer_ms_runs": [
+          32567.24,
+          32130.43,
+          32245.58,
+          32372.76,
+          32346.76
+        ],
+        "total_wall_ms_avg": 33000.12,
+        "total_wall_ms_runs": [
+          33224.3,
+          32798.26,
+          32917.94,
+          33047.89,
+          33012.21
+        ],
+        "load_ms_last_run": 179.69,
+        "rtf_infer": 0.0523,
+        "rtf_total_wall": 0.05338,
+        "faster_than_realtime_x": 19.1,
+        "precision": "float16",
+        "quantize": "none",
+        "chunk_count": "25",
+        "coreml_text_preview": "So, if you're above 20% body fat and you want fully visible abs, that means getting down to about 12% body fat. And the first question everyone asks is how long does that actually take? So, in this vi"
+      }
+    ],
+    "ane": [
+      {
+        "audio": "example_10_min_ASR.mp3",
+        "duration_sec": 618.2081,
+        "infer_ms_avg": 25828.41,
+        "infer_ms_runs": [
+          25866.56,
+          25808.91,
+          25884.79,
+          25816.57,
+          25765.21
+        ],
+        "total_wall_ms_avg": 26508.95,
+        "total_wall_ms_runs": [
+          26548.78,
+          26487.59,
+          26564.02,
+          26498.44,
+          26445.94
+        ],
+        "load_ms_last_run": 188.18,
+        "rtf_infer": 0.04178,
+        "rtf_total_wall": 0.04288,
+        "faster_than_realtime_x": 23.9,
+        "precision": "float16",
+        "quantize": "none",
+        "chunk_count": "25",
+        "coreml_text_preview": "So, if you're above 20% body fat and you want fully visible abs, that means getting down to about 12% body fat. And the first question everyone asks is how long does that actually take? So, in this vi"
+      }
+    ],
+    "gpu": [
+      {
+        "audio": "example_10_min_ASR.mp3",
+        "duration_sec": 618.2081,
+        "infer_ms_avg": 17810.48,
+        "infer_ms_runs": [
+          18038.3,
+          17780.38,
+          17757.69,
+          17727.39,
+          17748.62
+        ],
+        "total_wall_ms_avg": 19034.48,
+        "total_wall_ms_runs": [
+          19263.48,
+          19012.03,
+          18990.98,
+          18949.16,
+          18956.76
+        ],
+        "load_ms_last_run": 718.78,
+        "rtf_infer": 0.02881,
+        "rtf_total_wall": 0.03079,
+        "faster_than_realtime_x": 34.7,
+        "precision": "float16",
+        "quantize": "none",
+        "chunk_count": "25",
+        "coreml_text_preview": "So, if you're above 20% body fat and you want fully visible abs, that means getting down to about 12% body fat. And the first question everyone asks is how long does that actually take? So, in this vi"
+      }
+    ]
+  }
+}
