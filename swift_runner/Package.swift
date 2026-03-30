@@ -4,7 +4,7 @@ import PackageDescription
 let package = Package(
     name: "swift_runner",
     platforms: [
-        .macOS(.v13),
+        .macOS(.v15),
     ],
     products: [
         .executable(name: "swift_runner", targets: ["swift_runner"]),
